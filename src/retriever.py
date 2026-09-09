@@ -35,9 +35,32 @@ def _get_collection():
     return _collection
 
 
+def adaptive_k(scores: list[float], k_min: int = 3, k_max: int | None = None, margin: float = 0.05) -> int:
+    """Определяет, сколько из отсортированных по убыванию оценок релевантности
+    реально стоит использовать: держим чанки, пока их оценка остаётся в пределах
+    margin от лучшей оценки в выдаче, обрезаем на первом, что отстал сильнее.
+
+    Локальные разрывы между соседними оценками (первая версия этой функции)
+    оказались ненадёжным сигналом на этом корпусе: и узкие, и широкие вопросы
+    показывают одинаковый паттерн — один заметный скачок сразу после лучшего
+    результата, а затем долгий плавный хвост, — так что "локоть" в соседних
+    разрывах не отличает узкий вопрос от широкого. Абсолютный отступ от лучшей
+    оценки работает надёжнее: на широком вопросе весь плавный хвост держится
+    близко к лучшей оценке и укладывается в margin целиком (вернутся все); на
+    узком — оценки расходятся быстрее и выходят за margin раньше."""
+    n = len(scores) if k_max is None else min(len(scores), k_max)
+    if n <= k_min:
+        return n
+    floor = scores[0] - margin
+    for i in range(k_min, n):
+        if scores[i] < floor:
+            return i
+    return n
+
+
 def retrieve(query: str, k: int = 6) -> list[dict]:
     """Возвращает top-k чанков: [{text, source_title, author, chapter_title,
-    sequence_number, score}, ...], отсортированных по релевантности."""
+    sequence_number, source_type, cycle, score}, ...], отсортированных по релевантности."""
     model = _get_model()
     collection = _get_collection()
 
@@ -59,6 +82,8 @@ def retrieve(query: str, k: int = 6) -> list[dict]:
             "author": meta["author"],
             "chapter_title": meta["chapter_title"],
             "sequence_number": meta["sequence_number"],
+            "source_type": meta.get("source_type", "book"),
+            "cycle": meta.get("cycle", "horus_heresy"),
             "score": 1 - dist,  # т.к. эмбеддинги нормализованы, distance ~ косинусная
         })
     return chunks

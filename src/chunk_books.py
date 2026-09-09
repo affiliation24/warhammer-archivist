@@ -12,6 +12,7 @@ import glob
 from pathlib import Path
 
 BOOKS_DIR = Path(__file__).resolve().parent.parent / "data" / "processed" / "books"
+WIKI_DIR = Path(__file__).resolve().parent.parent / "data" / "processed" / "wiki"
 OUT_PATH = Path(__file__).resolve().parent.parent / "data" / "processed" / "chunks.jsonl"
 
 TARGET_CHARS = 1600   # ~ 400 токенов русского текста
@@ -97,6 +98,33 @@ def main():
                     chunk_idx += 1
                     total_chunks += 1
             print(f"  {book['title']}: {chunk_idx} чанков")
+
+    wiki_files = sorted(glob.glob(str(WIKI_DIR / "*.json")))
+    print(f"\nНайдено {len(wiki_files)} вики-страниц для чанкинга")
+
+    with open(OUT_PATH, "a", encoding="utf-8") as out:
+        for wf in wiki_files:
+            page = json.load(open(wf, encoding="utf-8"))
+            slug = Path(wf).stem
+            chunk_idx = 0
+            for section in page["sections"]:
+                pieces = split_section(section["text"])
+                for piece in pieces:
+                    record = {
+                        "chunk_id": f"wiki_{slug}_{chunk_idx:04d}",
+                        "source_type": "wiki",
+                        "source_title": page["title"],
+                        "author": None,
+                        "sequence_number": None,
+                        "cycle": "wiki",
+                        "chapter_title": section["chapter_title"],
+                        "chunk_index_in_source": chunk_idx,
+                        "text": piece,
+                    }
+                    out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    chunk_idx += 1
+                    total_chunks += 1
+            print(f"  {page['title']}: {chunk_idx} чанков")
 
     print(f"\nГотово: {total_chunks} чанков -> {OUT_PATH}")
 

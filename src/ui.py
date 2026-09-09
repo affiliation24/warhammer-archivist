@@ -4,23 +4,103 @@
 звук просто не проигрывается (никаких ошибок), так что бот работает и без них.
 """
 import os
+import random
 import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
-GREEN = "\033[92m"       # яркий зелёный — баннер, акценты, статусные фразы
+GREEN = "\033[92m"       # яркий зелёный — акценты, статусные фразы
 DARK_GREEN = "\033[32m"  # тёмный зелёный — основной текст ответов
 DIM_GREEN = "\033[2;32m" # приглушённый — вспомогательные подсказки
 BOLD = "\033[1m"
 RESET = "\033[0m"
 
+# готик-индастриал палитра для второго баннера (256-цветной ANSI) — приглушённые,
+# "состаренные" тона вместо ярких: латунь/бронза, потускневшее золото, кровь,
+# кость/пергамент, холодный тусклый металл. Ориентир — палитра Adeptus Mechanicus
+# (тёмно-красный, латунь, сталь) и общая готик-индастриал эстетика Warhammer 40k.
+BRASS = "\033[1;38;5;178m"   # латунь/бронза, жирным — заголовок
+BONE = "\033[38;5;223m"      # кость/пергамент — подзаголовок
+BLOOD = "\033[38;5;131m"     # тусклый кровавый — акцентные символы
+IRON = "\033[38;5;238m"      # тусклая сталь — структурные линии/орнамент
+DULL_BRASS = "\033[38;5;136m"  # тусклая латунь без жирности — ненавязчивые подсказки команд
+
 LETTER_GAP = 1  # межбуквенный интервал в баннере
 WORD_GAP = 3    # межсловный интервал в баннере
 
 TYPEWRITER_DELAY = 0.012  # секунд на символ
+
+# свой блочный шрифт 5x5 для полноэкранного сплэша при старте — заливка "▓"
+# (плотнее и текстурнее, чем сплошной "█") даёт более "гранитный", шершавый вид,
+# нужные буквы только для "MECHANICUS"
+_BLOCK_FONT = {
+    "M": ["▓   ▓", "▓▓ ▓▓", "▓ ▓ ▓", "▓   ▓", "▓   ▓"],
+    "E": ["▓▓▓▓▓", "▓    ", "▓▓▓  ", "▓    ", "▓▓▓▓▓"],
+    "C": [" ▓▓▓▓", "▓    ", "▓    ", "▓    ", " ▓▓▓▓"],
+    "H": ["▓   ▓", "▓   ▓", "▓▓▓▓▓", "▓   ▓", "▓   ▓"],
+    "A": [" ▓▓▓ ", "▓   ▓", "▓▓▓▓▓", "▓   ▓", "▓   ▓"],
+    "N": ["▓   ▓", "▓▓  ▓", "▓ ▓ ▓", "▓  ▓▓", "▓   ▓"],
+    "I": ["▓▓▓▓▓", "  ▓  ", "  ▓  ", "  ▓  ", "▓▓▓▓▓"],
+    "U": ["▓   ▓", "▓   ▓", "▓   ▓", "▓   ▓", " ▓▓▓ "],
+    "S": [" ▓▓▓▓", "▓    ", " ▓▓▓ ", "    ▓", "▓▓▓▓ "],
+    " ": ["  ", "  ", "  ", "  ", "  "],
+}
+
+# затухающая последовательность плотности символов для эффекта стекающих капель
+_DRIP_CHARS = ["▓", "▒", "░"]
+
+SPLASH_DURATION = 1.8  # секунд, полноэкранный сплэш держится перед стартом
+
+
+def _block_text(word: str) -> list[str]:
+    """Крупная надпись из блочного шрифта выше, посимвольно собранная в 5 строк."""
+    glyphs = [_BLOCK_FONT.get(ch.upper(), _BLOCK_FONT[" "]) for ch in word]
+    return [" ".join(g[row] for g in glyphs) for row in range(5)]
+
+
+def _add_drips(lines: list[str], max_drip: int = 4) -> list[str]:
+    """Добавляет под надписью несколько строк "стекающих капель": из каждой
+    закрашенной колонки нижнего края буквы вниз тянется капля, плотность
+    символа тает ▓ -> ▒ -> ░ по мере удаления, длина капель случайна и
+    неравномерна — отсюда ощущение стекающей вязкой смолы."""
+    width = len(lines[0])
+    drip_rows = [[" "] * width for _ in range(max_drip)]
+    for col in range(width):
+        if lines[-1][col] == " ":
+            continue
+        if random.random() < 0.35:
+            continue  # не из каждой точки капает — иначе выглядит слишком равномерно
+        length = random.randint(1, max_drip)
+        for row in range(length):
+            char_idx = min(row, len(_DRIP_CHARS) - 1)
+            drip_rows[row][col] = _DRIP_CHARS[char_idx]
+    return lines + ["".join(row) for row in drip_rows]
+
+
+def show_splash(word: str = "MECHANICUS", duration: float = SPLASH_DURATION) -> None:
+    """Полноэкранный сплэш перед стартом программы: крупная надпись по центру
+    терминала с эффектом стекающих капель под буквами, держится duration секунд,
+    затем экран очищается — после этого вызывающий код показывает обычную
+    компактную рамку-баннер."""
+    lines = _add_drips(_block_text(word))
+    letter_height = 5
+    term_width, term_height = shutil.get_terminal_size(fallback=(80, 24))
+    block_width = len(lines[0])
+    start_row = max(0, (term_height - len(lines)) // 2)
+    start_col = max(0, (term_width - block_width) // 2)
+
+    clear_screen()
+    for i, text_line in enumerate(lines):
+        color = GREEN if i < letter_height else DIM_GREEN  # капли чуть приглушённее самих букв
+        sys.stdout.write(f"\033[{start_row + i + 1};{start_col + 1}H{color}{text_line}{RESET}")
+    sys.stdout.flush()
+    time.sleep(duration)
+    clear_screen()
+
 
 SOUNDS_DIR = Path(__file__).resolve().parent.parent / "sounds"
 
@@ -59,42 +139,78 @@ def _spaced(text: str, letter_gap: int = LETTER_GAP, word_gap: int = WORD_GAP) -
 
 
 def render_banner() -> str:
-    """Статичный баннер в рамке из псевдографики, отцентрованный по ширине терминала.
-    Ширина рамки подбирается автоматически под самую длинную строку содержимого,
-    затем вся рамка центрируется горизонтальным отступом."""
+    """Готик-индастриал баннер (без прямоугольной рамки): готическая арка сверху
+    и зеркально снизу, "клёпаный" разделитель, орнамент из шестерён/крестов.
+    Возвращает уже раскрашенную (ANSI) многоцветную строку — не оборачивать
+    в green(), цвета заданы построчно внутри. Ширина подбирается под контент
+    и центрируется по ширине терминала."""
     title1 = _spaced("ARCHIVE TERMINAL")
     title2 = _spaced("ADEPTUS MECHANICUS")
     info = "Machine Spirit awakened."
 
-    box_width = max(len(title1), len(title2), len(info)) + 8
+    box_width = max(len(title1), len(title2), len(info)) + 14
     term_width = shutil.get_terminal_size(fallback=(box_width + 4, 24)).columns
     indent = " " * max(0, (term_width - box_width) // 2)
 
-    def line(content: str = "", align: str = "center") -> str:
-        inner = box_width - 2
-        if align == "center":
-            content = content.center(inner)
-        else:
-            content = content.ljust(inner)
-        return f"{indent}║{content}║"
+    def centered(text: str, color: str) -> str:
+        return f"{indent}{color}{text.center(box_width)}{RESET}"
 
-    top = f"{indent}╔{'═' * (box_width - 2)}╗"
-    bottom = f"{indent}╚{'═' * (box_width - 2)}╝"
-    sep = f"{indent}╟{'─' * (box_width - 2)}╢"
+    def rivet_rule(color: str = IRON) -> str:
+        body = "═" * (box_width - 4)
+        return f"{indent}{color}  •{body}•  {RESET}"
+
+    def arch(flip: bool = False) -> list[str]:
+        apex = "✠"
+        shoulders = ["╱   ╲", "╱       ╲", "╱           ╲"]
+        rows = [apex] + shoulders
+        if flip:
+            rows = rows[::-1]
+        return [f"{indent}{IRON}{row.center(box_width)}{RESET}" for row in rows]
+
+    ornament = " ".join("⚙" if i % 2 == 0 else "✠" for i in range(7))
 
     rows = [
-        top,
-        line(),
-        line(title1),
-        line(title2),
-        line(),
-        sep,
-        line(),
-        line(info),
-        line(),
-        bottom,
+        *arch(),
+        rivet_rule(BLOOD),
+        centered("", GREEN),
+        centered(title1, BRASS),
+        centered(title2, BONE),
+        centered("", GREEN),
+        centered(ornament, IRON),
+        rivet_rule(BLOOD),
+        centered(info, DIM_GREEN),
+        *arch(flip=True),
     ]
     return "\n".join(rows)
+
+
+_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+def start_spinner(redraw_fn, interval: float = 0.15):
+    """Запускает текстовую анимацию "мышления" в фоновом потоке — вызывает
+    redraw_fn(frame) каждые interval секунд, пока не остановлена. frame — один
+    символ вращающегося индикатора. Использовать только пока основной поток
+    занят чем-то блокирующим (например, ждёт ответ Groq) и не читает stdin —
+    иначе анимация будет мешать вводу. Возвращает (stop_event, thread);
+    останавливать строго через stop_spinner() перед любым следующим выводом."""
+    stop_event = threading.Event()
+
+    def _loop():
+        i = 0
+        while not stop_event.is_set():
+            redraw_fn(_SPINNER_FRAMES[i % len(_SPINNER_FRAMES)])
+            i += 1
+            stop_event.wait(interval)
+
+    thread = threading.Thread(target=_loop, daemon=True)
+    thread.start()
+    return stop_event, thread
+
+
+def stop_spinner(stop_event: threading.Event, thread: threading.Thread) -> None:
+    stop_event.set()
+    thread.join()
 
 
 def type_out(text: str, delay: float = TYPEWRITER_DELAY, color: str = DARK_GREEN) -> None:

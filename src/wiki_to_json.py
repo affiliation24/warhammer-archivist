@@ -1,10 +1,14 @@
-"""Парсер MediaWiki API (Fandom Warhammer 40k Wiki) в структурированный JSON,
-дополнительный источник для RAG (Этап 1b, расширение roadmap).
+"""Парсер MediaWiki API (Fandom Warhammer 40k Wiki, русский раздел) в структурированный
+JSON, дополнительный источник для RAG (Этап 1b, расширение roadmap).
 
 Lexicanum блокирует программный доступ (Cloudflare bot-challenge на api.php),
 поэтому источник — warhammer40k.fandom.com, чей API открыт для сторонних
 инструментов. TextExtracts на этой вики не установлен, поэтому тянем сырую
 wikitext-разметку (action=query&prop=revisions) и чистим её сами.
+
+Берём русский раздел (/ru/), а не английский — эмбеддинги multilingual-e5 заметно
+предпочитают совпадение языка запроса и документа: на русских запросах английские
+чанки почти никогда не попадают в top-k, даже если релевантны по смыслу.
 
 Контент Fandom-вики лицензирован по CC BY-SA — при использовании чанков в
 ответах бота источник должен оставаться атрибутируемым, поэтому в каждый
@@ -18,8 +22,8 @@ from pathlib import Path
 
 import requests
 
-API_URL = "https://warhammer40k.fandom.com/api.php"
-WIKI_BASE_URL = "https://warhammer40k.fandom.com/wiki/"
+API_URL = "https://warhammer40k.fandom.com/ru/api.php"
+WIKI_BASE_URL = "https://warhammer40k.fandom.com/ru/wiki/"
 OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "processed" / "wiki"
 
 HEADERS = {"User-Agent": "warhammer-rag-bot/0.1 (personal local project, not for redistribution)"}
@@ -50,6 +54,31 @@ def fetch_category_members(category: str, limit: int = 500) -> list[str]:
     return titles[:limit]
 
 
+def fetch_all_article_titles() -> list[str]:
+    """Все страницы основного пространства имён (namespace 0), без редиректов —
+    примерно соответствует "articles" из siteinfo/statistics."""
+    titles = []
+    params = {
+        "action": "query",
+        "list": "allpages",
+        "apnamespace": 0,
+        "apfilterredir": "nonredirects",
+        "aplimit": 500,
+        "format": "json",
+    }
+    while True:
+        resp = requests.get(API_URL, params=params, headers=HEADERS, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        titles.extend(p["title"] for p in data.get("query", {}).get("allpages", []))
+        cont = data.get("continue", {}).get("apcontinue")
+        if not cont:
+            break
+        params["apcontinue"] = cont
+        time.sleep(REQUEST_DELAY)
+    return titles
+
+
 def fetch_raw_wikitext(title: str) -> str | None:
     params = {
         "action": "query",
@@ -59,8 +88,18 @@ def fetch_raw_wikitext(title: str) -> str | None:
         "titles": title,
         "format": "json",
     }
-    resp = requests.get(API_URL, params=params, headers=HEADERS, timeout=30)
-    resp.raise_for_status()
+    last_exc = None
+    for attempt in range(3):
+        try:
+            resp = requests.get(API_URL, params=params, headers=HEADERS, timeout=30)
+            resp.raise_for_status()
+            break
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            time.sleep(2 * (attempt + 1))
+    else:
+        print(f"  [ERROR] сетевой сбой после 3 попыток: {last_exc}", file=sys.stderr)
+        return None
     pages = resp.json().get("query", {}).get("pages", {})
     for page in pages.values():
         if "missing" in page:
@@ -143,7 +182,11 @@ def fetch_and_save(titles: list[str]) -> None:
     ok, skipped = 0, []
     for title in titles:
         print(f"-> {title}")
-        data = build_page_json(title)
+        try:
+            data = build_page_json(title)
+        except Exception as e:
+            print(f"  [ERROR] {e}", file=sys.stderr)
+            data = None
         time.sleep(REQUEST_DELAY)
         if data is None:
             skipped.append(title)
@@ -167,6 +210,10 @@ if __name__ == "__main__":
     elif args[0] == "--category":
         titles = fetch_category_members(args[1])
         print(f"В категории '{args[1]}' найдено {len(titles)} страниц")
+        fetch_and_save(titles)
+    elif args[0] == "--all":
+        titles = fetch_all_article_titles()
+        print(f"Всего статей на вики: {len(titles)}")
         fetch_and_save(titles)
     else:
         fetch_and_save([t.strip() for t in " ".join(args).split(",") if t.strip()])
