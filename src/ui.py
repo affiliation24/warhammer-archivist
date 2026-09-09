@@ -138,6 +138,20 @@ def _spaced(text: str, letter_gap: int = LETTER_GAP, word_gap: int = WORD_GAP) -
     return (" " * word_gap).join((" " * letter_gap).join(word) for word in text.split(" "))
 
 
+GREETING_VARIANTS = (
+    "Machine Spirit awakened.",
+    "Cognition matrix online.",
+    "Sacred circuits humming.",
+    "The Omnissiah watches.",
+    "Binary rites complete.",
+)
+
+# один вариант на весь процесс — выбирается один раз при импорте, а не на каждой
+# перерисовке экрана (render_banner вызывается при любом действии), иначе текст
+# приветствия дёргался бы туда-сюда при каждом вопросе/команде в течение сессии
+_GREETING = random.choice(GREETING_VARIANTS)
+
+
 def render_banner() -> str:
     """Готик-индастриал баннер (без прямоугольной рамки): готическая арка сверху
     и зеркально снизу, "клёпаный" разделитель, орнамент из шестерён/крестов.
@@ -146,7 +160,7 @@ def render_banner() -> str:
     и центрируется по ширине терминала."""
     title1 = _spaced("ARCHIVE TERMINAL")
     title2 = _spaced("ADEPTUS MECHANICUS")
-    info = "Machine Spirit awakened."
+    info = _GREETING
 
     box_width = max(len(title1), len(title2), len(info)) + 14
     term_width = shutil.get_terminal_size(fallback=(box_width + 4, 24)).columns
