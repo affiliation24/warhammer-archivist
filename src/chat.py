@@ -1,5 +1,7 @@
 """CLI-интерфейс чат-бота (Этап 8 roadmap)."""
 import random
+import select
+import sys
 
 from generator import ERA_LABELS, AccessDeniedError, EraClarificationNeeded, TokensExhaustedError, answer
 from ui import (
@@ -100,6 +102,24 @@ def _match_era_choice(user_input: str, eras: list[str]) -> str | None:
     return None
 
 
+def _drain_pasted_lines() -> int:
+    """input() читает только первую строку — если пользователь вставил
+    многострочный текст (например, случайно скопировал вопрос вместе с
+    предыдущим ответом бота), остальные строки остаются в буфере stdin и на
+    следующих итерациях цикла подхватываются как отдельные новые "вопросы".
+    Так как это обычно фрагменты предыдущего ответа, они снова находят похожий
+    контент — выглядит как "бот бесконечно отвечает на один и тот же вопрос".
+    Забираем и отбрасываем всё, что уже лежит в буфере stdin (пришло с тем же
+    вставленным блоком), не дожидаясь новых нажатий Enter от пользователя."""
+    drained = 0
+    while select.select([sys.stdin], [], [], 0)[0]:
+        line = sys.stdin.readline()
+        if not line:
+            break
+        drained += 1
+    return drained
+
+
 def main():
     play_sound("startup")
     show_splash()
@@ -119,10 +139,17 @@ def _run(last_chunks):
     while True:
         try:
             question = input("\n> ").strip()
+            extra = _drain_pasted_lines()
         except (EOFError, KeyboardInterrupt):
             _redraw(green(FAREWELL))
             play_sound("exit")
             break
+
+        if extra:
+            print(dim(
+                f"(во вставленном тексте было несколько строк — учтена только "
+                f"первая, остальные {extra} отброшены)"
+            ))
 
         if not question:
             continue
