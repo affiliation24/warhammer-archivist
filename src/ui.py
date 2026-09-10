@@ -9,8 +9,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import termios
 import threading
 import time
+import tty
 from pathlib import Path
 
 GREEN = "\033[92m"       # яркий зелёный — акценты, статусные фразы
@@ -225,6 +227,57 @@ def start_spinner(redraw_fn, interval: float = 0.15):
 def stop_spinner(stop_event: threading.Event, thread: threading.Thread) -> None:
     stop_event.set()
     thread.join()
+
+
+def read_key() -> str:
+    """Считывает одно нажатие клавиши в raw-режиме терминала (без ожидания
+    Enter) и распознаёт стрелки вверх/вниз (ANSI escape-последовательности) и
+    Enter. Возвращает 'up', 'down', 'enter' или сам введённый символ для
+    остального. Терминал гарантированно возвращается в обычный режим даже при
+    исключении (finally), иначе он остался бы "сломанным" после выхода."""
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        ch = sys.stdin.read(1)
+        if ch == "\x03":  # Ctrl+C в raw-режиме не поднимает KeyboardInterrupt сам
+            raise KeyboardInterrupt
+        if ch == "\x1b":
+            ch2 = sys.stdin.read(1)
+            ch3 = sys.stdin.read(1) if ch2 == "[" else ""
+            if ch2 == "[" and ch3 == "A":
+                return "up"
+            if ch2 == "[" and ch3 == "B":
+                return "down"
+            return "escape"
+        if ch in ("\r", "\n"):
+            return "enter"
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def select_menu(options: list, render_fn) -> int:
+    """Интерактивный выбор стрелками вверх/вниз + Enter. render_fn(selected_index)
+    должен полностью перерисовать экран с подсветкой текущего варианта — вызов
+    происходит один раз перед началом и затем при каждом изменении выбора.
+    Возвращает индекс выбранного варианта. Если stdin — не терминал (пайп,
+    автотест) или в нём уже ничего нет, тихо возвращает 0 без ожидания ввода —
+    иначе программа зависла бы, ожидая нажатие, которого никогда не будет."""
+    if not sys.stdin.isatty():
+        return 0
+    selected = 0
+    render_fn(selected)
+    while True:
+        key = read_key()
+        if key == "up":
+            selected = (selected - 1) % len(options)
+            render_fn(selected)
+        elif key == "down":
+            selected = (selected + 1) % len(options)
+            render_fn(selected)
+        elif key == "enter":
+            return selected
 
 
 def type_out(text: str, delay: float = TYPEWRITER_DELAY, color: str = DARK_GREEN) -> None:

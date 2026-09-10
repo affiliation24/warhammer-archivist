@@ -13,6 +13,7 @@ from ui import (
     play_sound,
     render_banner,
     render_sources,
+    select_menu,
     show_splash,
     start_background_music,
     start_spinner,
@@ -84,22 +85,19 @@ def _redraw(body: str = "") -> None:
         print(body)
 
 
-def _era_options_text(by_era: dict) -> str:
-    eras = sorted(by_era.keys())
-    lines = [dim(f"  {i}. {ERA_LABELS[era]}") for i, era in enumerate(eras, 1)]
-    return "\n".join(lines), eras
-
-
-def _match_era_choice(user_input: str, eras: list[str]) -> str | None:
-    text = user_input.strip().lower()
-    for i, era in enumerate(eras, 1):
-        if text == str(i):
-            return era
-    if any(w in text for w in ("хорус", "крестов", "30", "31")):
-        return "heresy" if "heresy" in eras else None
-    if any(w in text for w in ("соврем", "текущ", "41", "42", "индомитус", "ныне")):
-        return "current" if "current" in eras else None
-    return None
+def _era_menu_body(echo: str, eras: list[str], selected: int) -> str:
+    lines = [
+        echo,
+        "",
+        green("Найдены релевантные данные из разных эпох. Выберите (↑/↓, Enter):"),
+    ]
+    for i, era in enumerate(eras):
+        label = ERA_LABELS[era]
+        if i == selected:
+            lines.append(green(f"  → {label}"))
+        else:
+            lines.append(dim(f"    {label}"))
+    return "\n".join(lines)
 
 
 def _drain_pasted_lines() -> int:
@@ -133,9 +131,50 @@ def main():
         stop_background_music()
 
 
-def _run(last_chunks):
-    pending = None  # EraClarificationNeeded, ждём выбор эпохи от пользователя
+def _resolve_and_answer(question: str):
+    """Обрабатывает один вопрос целиком, включая цикл уточнения эпохи —
+    неоднозначность разрешается сразу же через интерактивное меню (стрелки +
+    Enter), а не ожиданием следующего свободного ввода в основном цикле.
+    Возвращает (reply, chunks, echo) при успехе или None, если по пути
+    произошла ошибка (уже отображена пользователю на экране)."""
+    era_override = None
+    while True:
+        echo = dim(f"> {question}")
+        spin_stop, spin_thread = start_spinner(
+            lambda frame: _redraw(f"{echo}\n\n{dim(f'{frame} {PROCESSING}')}")
+        )
+        try:
+            reply, chunks = answer(question, era_chunks_override=era_override)
+        except EraClarificationNeeded as e:
+            stop_spinner(spin_stop, spin_thread)
+            eras = sorted(e.by_era.keys())
+            idx = select_menu(eras, lambda i: _redraw(_era_menu_body(echo, eras, i)))
+            question = e.question
+            era_override = e.by_era[eras[idx]]
+            continue
+        except TokensExhaustedError as e:
+            stop_spinner(spin_stop, spin_thread)
+            _redraw(f"{echo}\n\n{green(str(e))}")
+            play_sound("error")
+            return None
+        except AccessDeniedError as e:
+            stop_spinner(spin_stop, spin_thread)
+            _redraw(f"{echo}\n\n{green(str(e))}")
+            play_sound("error")
+            return None
+        except RuntimeError as e:
+            stop_spinner(spin_stop, spin_thread)
+            _redraw(f"{echo}\n\n{dim(f'Ошибка: {e}')}")
+            return None
+        except Exception as e:
+            stop_spinner(spin_stop, spin_thread)
+            _redraw(f"{echo}\n\n{dim(f'Ошибка обращения к Groq: {e}')}")
+            return None
+        stop_spinner(spin_stop, spin_thread)
+        return reply, chunks, echo
 
+
+def _run(last_chunks):
     while True:
         try:
             question = input("\n> ").strip()
@@ -167,60 +206,16 @@ def _run(last_chunks):
             play_sound("answer")
             continue
 
-        era_override = None
-        if pending is not None:
-            eras = sorted(pending.by_era.keys())
-            chosen = _match_era_choice(question, eras)
-            if chosen is not None:
-                question = pending.question
-                era_override = pending.by_era[chosen]
-            # если выбор не распознан — считаем, что пользователь задал новый
-            # вопрос, а не уточнял эпоху, и просто сбрасываем pending ниже
-            pending = None
+        result = _resolve_and_answer(question)
+        if result is None:
+            continue
+        reply, chunks, echo = result
 
-        echo = dim(f"> {question}")
-        spin_stop, spin_thread = start_spinner(
-            lambda frame: _redraw(f"{echo}\n\n{dim(f'{frame} {PROCESSING}')}")
-        )
-
-        try:
-            reply, chunks = answer(question, era_chunks_override=era_override)
-        except EraClarificationNeeded as e:
-            stop_spinner(spin_stop, spin_thread)
-            pending = e
-            options_text, _ = _era_options_text(e.by_era)
-            body = (
-                f"{echo}\n\n"
-                f"{green('Найдены релевантные данные из разных эпох. Уточните, какая интересует:')}\n"
-                f"{options_text}"
-            )
-            _redraw(body)
-            continue
-        except TokensExhaustedError as e:
-            stop_spinner(spin_stop, spin_thread)
-            _redraw(f"{echo}\n\n{green(str(e))}")
-            play_sound("error")
-            continue
-        except AccessDeniedError as e:
-            stop_spinner(spin_stop, spin_thread)
-            _redraw(f"{echo}\n\n{green(str(e))}")
-            play_sound("error")
-            continue
-        except RuntimeError as e:
-            stop_spinner(spin_stop, spin_thread)
-            _redraw(f"{echo}\n\n{dim(f'Ошибка: {e}')}")
-            continue
-        except Exception as e:
-            stop_spinner(spin_stop, spin_thread)
-            _redraw(f"{echo}\n\n{dim(f'Ошибка обращения к Groq: {e}')}")
-            continue
-
-        stop_spinner(spin_stop, spin_thread)
         last_chunks = chunks
         _redraw(echo)
+        play_sound("answer")
         type_out(reply)
         print(dim("(наберите /sources, чтобы увидеть источники ответа)"))
-        play_sound("answer")
 
 
 if __name__ == "__main__":
