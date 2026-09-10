@@ -29,6 +29,7 @@ BOOK_DIRS = [
     Path(__file__).resolve().parent.parent / "book" / "primarchs",
     Path(__file__).resolve().parent.parent / "book" / "siege_of_terra",
     Path(__file__).resolve().parent.parent / "book" / "night_lords",
+    Path(__file__).resolve().parent.parent / "book" / "eisenhorn_ravenor",
 ]
 OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "processed" / "books"
 
@@ -131,6 +132,16 @@ BOOK_META = {
     "01_Ловец_душ_Аарон_Дембски-Боуден.epub": ("Ловец душ", "Аарон Дембски-Боуден", 1, "night_lords"),
     "02_Кровавый_Корсар_Аарон_Дембски-Боуден.fb2": ("Кровавый Корсар", "Аарон Дембски-Боуден", 2, "night_lords"),
     "03_Разведчик_Пустоты_Аарон_Дембски-Боуден.fb2": ("Разведчик Пустоты", "Аарон Дембски-Боуден", 3, "night_lords"),
+    # циклы "Eisenhorn" и "Ravenor" — инквизиция, 41-е тысячелетие, совсем другая
+    # эпоха, чем Ересь Хоруса (30-31-е) — cycle="eisenhorn_ravenor" классифицируется
+    # как ERA_CURRENT в generator.classify_chunk_era, а не как ERA_HERESY
+    "01_Ордо_Ксенос_Дэн_Абнетт.fb2": ("Инквизитор. Ордо Ксенос", "Дэн Абнетт", 1, "eisenhorn_ravenor"),
+    "02_Ордо_Маллеус_Дэн_Абнетт.fb2": ("Инквизитор. Ордо Маллеус", "Дэн Абнетт", 2, "eisenhorn_ravenor"),
+    "03_Ордо_Еретикус_Дэн_Абнетт.fb2": ("Инквизитор. Ордо Еретикус", "Дэн Абнетт", 3, "eisenhorn_ravenor"),
+    "04_Магос_Дэн_Абнетт.epub": ("Магос: Архивы Грегора Эйзенхорна", "Дэн Абнетт", 4, "eisenhorn_ravenor"),
+    "05_Рейвенор_Дэн_Абнетт.fb2": ("Рейвенор", "Дэн Абнетт", 5, "eisenhorn_ravenor"),
+    "06_Возвращение_Рейвенора_Дэн_Абнетт.fb2": ("Возвращение Рейвенора", "Дэн Абнетт", 6, "eisenhorn_ravenor"),
+    "07_Рейвенор_отступник_Дэн_Абнетт.fb2": ("Рейвенор — отступник", "Дэн Абнетт", 7, "eisenhorn_ravenor"),
 }
 
 

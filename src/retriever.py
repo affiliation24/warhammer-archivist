@@ -123,9 +123,15 @@ def _title_match_chunks(query: str, exclude_titles: set, per_title_cap: int = 4)
     вопросе стоит "Детей" (родительный падеж), точное совпадение подстроки не
     срабатывает, а по чистому косинусному сходству источник на 497-м месте).
     Сравниваем не точную подстроку, а "стебли" слов названия — так падеж не
-    важен. Если все значимые слова названия совпали — подключаем чанки этого
+    важен. Сравнение по границам слов (стебель — префикс отдельного слова
+    запроса), а не "подстрока где угодно в тексте запроса": короткое название
+    вроде "Горе" (стебель "гор") иначе ложно совпадает с текстом внутри
+    середины совсем другого слова — например "Грегор" содержит "гор" на
+    позиции 3-5, хотя само слово "Грегор" не начинается на "гор" — поймано
+    эмпирически на вопросе про "Грегора Эйзенхорна". Если все значимые слова
+    названия совпали (по такому словному сравнению) — подключаем чанки этого
     источника напрямую, независимо от оценки эмбеддинга."""
-    query_lower = query.lower()
+    query_words = query.lower().split()
     matched_titles = []
     for title in _get_all_titles():
         if title in exclude_titles:
@@ -133,7 +139,10 @@ def _title_match_chunks(query: str, exclude_titles: set, per_title_cap: int = 4)
         words = [w for w in title.lower().split() if len(w) >= 3]
         if not words:
             continue
-        if all(_stem(w) in query_lower for w in words):
+        if all(
+            any(qw.startswith(_stem(w)) for qw in query_words)
+            for w in words
+        ):
             matched_titles.append(title)
     if not matched_titles:
         return []

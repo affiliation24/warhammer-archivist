@@ -48,12 +48,15 @@ _CURRENT_MARKERS = (
 
 
 def classify_chunk_era(chunk: dict) -> str:
-    """Эвристическая метка эпохи чанка. Для книг обоих текущих циклов эпоха известна
-    точно (обе — Крестовый поход/Ересь). Для вики — по ключевым словам в заголовке
+    """Эвристическая метка эпохи чанка. Для книг с известным циклом эпоха
+    определяется прямо по этому полю (не эвристикой) — так надёжнее, чем угадывать
+    по ключевым словам в начале текста. Для вики — по ключевым словам в заголовке
     и начале текста; если маркеров нет или есть маркеры обеих эпох — "unknown"
     (модель тогда сама прямо скажет, что эпоха не определена, вместо угадывания)."""
     if chunk.get("cycle") in ("horus_heresy", "primarchs", "siege_of_terra", "night_lords"):
         return ERA_HERESY
+    if chunk.get("cycle") == "eisenhorn_ravenor":
+        return ERA_CURRENT
     haystack = f"{chunk.get('chapter_title') or ''} {chunk['text'][:400]}".lower()
     has_heresy = any(m in haystack for m in _HERESY_MARKERS)
     has_current = any(m in haystack for m in _CURRENT_MARKERS)
