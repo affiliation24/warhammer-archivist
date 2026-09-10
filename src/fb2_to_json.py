@@ -28,6 +28,7 @@ BOOK_DIRS = [
     Path(__file__).resolve().parent.parent / "book" / "horus_heresy",
     Path(__file__).resolve().parent.parent / "book" / "primarchs",
     Path(__file__).resolve().parent.parent / "book" / "siege_of_terra",
+    Path(__file__).resolve().parent.parent / "book" / "night_lords",
 ]
 OUT_DIR = Path(__file__).resolve().parent.parent / "data" / "processed" / "books"
 
@@ -126,6 +127,10 @@ BOOK_META = {
     "07_Конец_и_смерть_Том_1_Дэн_Абнетт.epub": ("Конец и смерть. Том 1", "Дэн Абнетт", 7, "siege_of_terra"),
     "08_Конец_и_смерть_Том_2_Дэн_Абнетт.epub": ("Конец и смерть. Том 2", "Дэн Абнетт", 8, "siege_of_terra"),
     "09_Конец_и_смерть_Том_3_Дэн_Абнетт.epub": ("Конец и смерть. Том 3", "Дэн Абнетт", 9, "siege_of_terra"),
+    # трилогия "Night Lords" — легион Ночных Лордов, после Ереси Хоруса
+    "01_Ловец_душ_Аарон_Дембски-Боуден.epub": ("Ловец душ", "Аарон Дембски-Боуден", 1, "night_lords"),
+    "02_Кровавый_Корсар_Аарон_Дембски-Боуден.fb2": ("Кровавый Корсар", "Аарон Дембски-Боуден", 2, "night_lords"),
+    "03_Разведчик_Пустоты_Аарон_Дембски-Боуден.fb2": ("Разведчик Пустоты", "Аарон Дембски-Боуден", 3, "night_lords"),
 }
 
 

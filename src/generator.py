@@ -52,7 +52,7 @@ def classify_chunk_era(chunk: dict) -> str:
     точно (обе — Крестовый поход/Ересь). Для вики — по ключевым словам в заголовке
     и начале текста; если маркеров нет или есть маркеры обеих эпох — "unknown"
     (модель тогда сама прямо скажет, что эпоха не определена, вместо угадывания)."""
-    if chunk.get("cycle") in ("horus_heresy", "primarchs", "siege_of_terra"):
+    if chunk.get("cycle") in ("horus_heresy", "primarchs", "siege_of_terra", "night_lords"):
         return ERA_HERESY
     haystack = f"{chunk.get('chapter_title') or ''} {chunk['text'][:400]}".lower()
     has_heresy = any(m in haystack for m in _HERESY_MARKERS)
