@@ -32,6 +32,7 @@ from pathlib import Path
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 import chromadb
+import torch
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
@@ -42,6 +43,13 @@ MODEL_NAME = "intfloat/multilingual-e5-large"
 
 RRF_K = 60  # стандартная константа RRF (см. оригинальную статью, дефолт Elasticsearch/OpenSearch)
 
+# Модули-singleton'ы ниже (_model, _collection, _all_titles, _bm25_index) НЕ
+# потокобезопасны — паттерн "if _x is None: строим" гонится, если retrieve()
+# вызывается параллельно из нескольких потоков до прогрева кэша (например, из
+# веб-сервера с несколькими воркерами на один процесс). Для текущего использования
+# (однопоточный CLI, один вызов input()/ответ за раз в chat.py) это безопасно.
+# Если код когда-нибудь переедет за FastAPI/подобный сервер с многопоточностью —
+# нужно добавить threading.Lock() вокруг каждой инициализации.
 _model = None
 _collection = None
 _all_titles = None  # кэш уникальных названий источников для гибридного поиска по title
@@ -49,10 +57,21 @@ _bm25_index = None
 _bm25_chunks = None  # параллельный список dict-ов чанков (тот же порядок, что в BM25-индексе)
 
 
+def _pick_device() -> str:
+    """CUDA -> MPS (Apple Silicon) -> CPU. Раньше было захардкожено "mps" —
+    упало бы RuntimeError на любой машине без Apple Silicon (например, в
+    докер-контейнере на линукс-сервере с CUDA, куда RAG-сервисы обычно и едут)."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def _get_model():
     global _model
     if _model is None:
-        _model = SentenceTransformer(MODEL_NAME, device="mps")
+        _model = SentenceTransformer(MODEL_NAME, device=_pick_device())
     return _model
 
 
@@ -114,6 +133,24 @@ def _get_bm25():
                 tokenized_corpus.append(_tokenize(record["text"]))
         _bm25_chunks = chunks
         _bm25_index = BM25Okapi(tokenized_corpus)
+
+        # BM25 читает chunks.jsonl, а dense-поиск — коллекцию ChromaDB: это два
+        # независимых источника одних и тех же данных (см. модуль docstring про
+        # причину — читать jsonl быстрее, чем постранично выгружать текст из
+        # SQLite). Если когда-нибудь переиндексировать только Chroma (например,
+        # поменять чанкинг) и забыть пересобрать chunks.jsonl, оба поиска будут
+        # молча матчить разные версии текста под одними chunk_id — RRF тогда
+        # сливает два разных мира без единой видимой ошибки. Дёшево проверить
+        # хотя бы количество записей — не гарантия идентичности содержимого,
+        # но ловит самый частый случай рассинхрона (забыли один из шагов пайплайна).
+        chroma_count = _get_collection().count()
+        if len(_bm25_chunks) != chroma_count:
+            raise RuntimeError(
+                f"Рассинхрон данных: в chunks.jsonl {len(_bm25_chunks)} записей, "
+                f"в коллекции ChromaDB — {chroma_count}. Похоже, пайплайн "
+                f"(fb2_to_json.py -> chunk_books.py -> embed_and_index.py) "
+                f"прогнан не полностью после последнего изменения источников."
+            )
     return _bm25_index, _bm25_chunks
 
 
@@ -223,23 +260,27 @@ def _title_match_chunks(query: str, exclude_titles: set, per_title_cap: int = 4)
         return []
     collection = _get_collection()
 
-    result = collection.get(
-        where={"source_title": {"$in": matched_titles}},
-        include=["documents", "metadatas"],
-        limit=per_title_cap * len(matched_titles) * 3,  # запас, т.к. limit режет по всей выборке, не по группам
-    )
-    # ограничиваем per_title_cap чанками на каждое совпавшее название, чтобы
-    # длинная статья не вытеснила из контекста всё остальное
-    per_title_count: dict[str, int] = {}
+    # отдельный .get() на каждый совпавший тайтл, а не один общий $in-запрос
+    # с эвристическим запасом (limit * 3): общий лимит режет по всей выборке
+    # сразу, не по группам — если один совпавший источник заметно длиннее
+    # другого (больше чанков идёт первыми в выдаче Chroma), более короткий
+    # рисковал остаться вообще без чанков, несмотря на per_title_cap. Отдельный
+    # запрос на тайтл стоит на порядок дороже по количеству round-trip'ов, но
+    # даёт точную гарантию баланса — при малом числе совпавших тайтлов (обычно
+    # 0-2 за вопрос) цена пренебрежимо мала на локальной SQLite.
     chunks = []
-    for text, meta in zip(result["documents"], result["metadatas"]):
-        title = meta["source_title"]
-        if per_title_count.get(title, 0) >= per_title_cap:
-            continue
-        per_title_count[title] = per_title_count.get(title, 0) + 1
+    for title in matched_titles:
+        result = collection.get(
+            where={"source_title": title},
+            include=["documents", "metadatas"],
+            limit=per_title_cap,
+        )
         # искусственно высокая оценка — гарантирует место в топе adaptive_k независимо
         # от того, что скажет векторное сходство
-        chunks.append(_meta_to_chunk(text, meta, score=1.0))
+        chunks.extend(
+            _meta_to_chunk(text, meta, score=1.0)
+            for text, meta in zip(result["documents"], result["metadatas"])
+        )
     return chunks
 
 
@@ -256,9 +297,10 @@ def _rrf_fuse(dense_ids: list[str], bm25_ids: list[str], k: int = RRF_K) -> dict
     return scores
 
 
-def retrieve(query: str, k: int = 6) -> list[dict]:
+def retrieve(query: str, k: int = 6, k_prefetch: int = 30) -> list[dict]:
     """Возвращает top-k чанков: [{text, source_title, author, chapter_title,
     sequence_number, source_type, cycle, score}, ...], отсортированных по релевантности.
+    Гарантированно не длиннее k — включая чанки из гибридного поиска по названию.
 
     Гибридный поиск: dense (векторный, ChromaDB) + sparse (BM25 по тексту чанков),
     слитые через Reciprocal Rank Fusion (RRF) — dense хорошо ловит смысловые
@@ -266,7 +308,17 @@ def retrieve(query: str, k: int = 6) -> list[dict]:
     у dense-эмбеддингов проявляется "semantic drift" (см. модуль docstring).
     Сверху подмешивается ещё и гибридный поиск по названию источника
     (см. _title_match_chunks) — он остаётся отдельной, более узкой подстраховкой
-    именно для случая "источник целиком посвящён теме вопроса"."""
+    именно для случая "источник целиком посвящён теме вопроса".
+
+    k_prefetch — глубина префетча для dense и BM25 ДО слияния (не финальный
+    размер выдачи). Если брать оба списка шириной ровно k, RRF вырождается в
+    "первые k из dense плюс первые k из BM25" — документ, средне-хороший в обоих
+    рейтингах (скажем, на 8-м месте в каждом), может быть значимо релевантнее
+    любого из документов, попавших в оба top-k по отдельности, но просто не
+    попадёт в пул для слияния при слишком узком префетче. Стандартная практика
+    (см. также доки Qdrant) — префетчить широко (20-50) и резать до k только
+    после фьюжна."""
+    prefetch = max(k, k_prefetch)
     model = _get_model()
     collection = _get_collection()
 
@@ -274,7 +326,7 @@ def retrieve(query: str, k: int = 6) -> list[dict]:
 
     dense_result = collection.query(
         query_embeddings=[query_emb],
-        n_results=k,
+        n_results=prefetch,
         include=["documents", "metadatas", "distances"],
     )
     dense_ids = dense_result["ids"][0]
@@ -290,7 +342,7 @@ def retrieve(query: str, k: int = 6) -> list[dict]:
 
     bm25_index, bm25_chunks = _get_bm25()
     bm25_scores_all = bm25_index.get_scores(_tokenize(query))
-    top_bm25_positions = bm25_scores_all.argsort()[::-1][:k]
+    top_bm25_positions = bm25_scores_all.argsort()[::-1][:prefetch]
     bm25_ids = []
     bm25_by_id = {}
     for pos in top_bm25_positions:
@@ -331,7 +383,11 @@ def retrieve(query: str, k: int = 6) -> list[dict]:
     hybrid_chunks = _title_match_chunks(query, exclude_titles=matched_titles)
     chunks = hybrid_chunks + chunks  # гибридные по названию — в начало, приоритет выше RRF
 
-    return chunks
+    # без этой обрезки функция могла вернуть больше k (до k + до 4*per_title_cap
+    # чанков от _title_match_chunks) — нарушение контракта "top-k", на которое
+    # неявно рассчитывают вызывающие (например, оценка бюджета контекста в
+    # generator.py по числу чанков)
+    return chunks[:k]
 
 
 if __name__ == "__main__":
