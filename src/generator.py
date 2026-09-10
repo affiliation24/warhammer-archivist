@@ -17,7 +17,7 @@ from groq import (
 )
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
-from retriever import adaptive_k, retrieve
+from retriever import adaptive_k_relative, rerank, retrieve
 
 
 class TokensExhaustedError(RuntimeError):
@@ -307,21 +307,21 @@ def answer(
         # и для retrieval, и для итогового вопроса модели (см. correct_typos выше)
         question = correct_typos(question)
         # берём пул шире k — как для надёжного обнаружения смешения эпох, так и как
-        # "площадку" для адаптивной глубины: k здесь не жёсткий потолок, а ориентир
-        # размера пула, из которого adaptive_k сам решает, сколько чанков реально
-        # использовать, по тому, как быстро падает релевантность (см. retriever.py)
+        # "площадку" для reranker'а: k здесь не жёсткий потолок, а ориентир размера
+        # пула кандидатов (см. retriever.py)
         pool = retrieve(question, k=max(k * 4, 20))
         for c in pool:
-            c["era"] = classify_chunk_era(c)
+            c["era"] = classify_chunk_era(c)  # до reranking — порядок здесь не важен, era от score не зависит
+        pool = rerank(question, pool)  # пересчитывает score, сохраняет остальные поля (включая era)
         eras_present = {c["era"] for c in pool if c["era"] != ERA_UNKNOWN}
         if len(eras_present) > 1:
             by_era = {}
             for era in eras_present:
                 bucket = [c for c in pool if c["era"] == era]
-                n = adaptive_k([c["score"] for c in bucket], k_min=3, k_max=MAX_CONTEXT_CHUNKS)
+                n = adaptive_k_relative([c["score"] for c in bucket], k_min=3, k_max=MAX_CONTEXT_CHUNKS)
                 by_era[era] = bucket[:n]
             raise EraClarificationNeeded(question=question, by_era=by_era)
-        n = adaptive_k([c["score"] for c in pool], k_min=3, k_max=MAX_CONTEXT_CHUNKS)
+        n = adaptive_k_relative([c["score"] for c in pool], k_min=3, k_max=MAX_CONTEXT_CHUNKS)
         chunks = pool[:n]
 
     context = build_context(chunks)

@@ -23,6 +23,19 @@ EnsembleRetriever / LlamaIndex QueryFusionRetriever(mode="reciprocal_rerank").
 Реализовано здесь как BM25 через rank_bm25 (построен один раз из chunks.jsonl,
 ~1.1 ГБ RAM на весь корпус ~67k чанков — учтено при выборе, не пересобирается
 на каждый запрос) + RRF-слияние с результатами ChromaDB в retrieve() ниже.
+
+Reranker (2026-09-10): RRF даёт неплохой порядок, но остаётся статистическим
+приближением — cross-encoder reranker (BAAI/bge-reranker-v2-m3, поддерживает
+русский) читает пару (вопрос, текст чанка) целиком и оценивает релевантность
+напрямую, без разрыва между кодированием вопроса и текста отдельно друг от
+друга (в отличие от dense bi-encoder, где вопрос и документ кодируются
+независимо). Это одним механизмом покрывает то, для чего раньше пришлось
+вручную писать _title_match_chunks/_stem под каждый найденный на практике
+edge-case — reranker сам разбирается и с точным совпадением имени, и со
+смысловым сходством. См. rerank() и adaptive_k_relative() ниже; последняя —
+отдельная от adaptive_k() функция отсечения, т.к. шкала оценок reranker'а
+(сигмоида, резкий разброс 0.01-0.99) несовместима с шкалой dense-косинуса
+(плавная, 0.55-0.85), на которую был откалиброван adaptive_k(margin=...).
 """
 import json
 import os
@@ -34,16 +47,17 @@ os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 import chromadb
 import torch
 from rank_bm25 import BM25Okapi
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import CrossEncoder, SentenceTransformer
 
 CHROMA_DIR = Path(__file__).resolve().parent.parent / "data" / "chroma_db"
 CHUNKS_PATH = Path(__file__).resolve().parent.parent / "data" / "processed" / "chunks.jsonl"
 COLLECTION_NAME = "horus_heresy_e5large"
 MODEL_NAME = "intfloat/multilingual-e5-large"
+RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 
 RRF_K = 60  # стандартная константа RRF (см. оригинальную статью, дефолт Elasticsearch/OpenSearch)
 
-# Модули-singleton'ы ниже (_model, _collection, _all_titles, _bm25_index) НЕ
+# Модули-singleton'ы ниже (_model, _collection, _all_titles, _bm25_index, _reranker) НЕ
 # потокобезопасны — паттерн "if _x is None: строим" гонится, если retrieve()
 # вызывается параллельно из нескольких потоков до прогрева кэша (например, из
 # веб-сервера с несколькими воркерами на один процесс). Для текущего использования
@@ -55,6 +69,7 @@ _collection = None
 _all_titles = None  # кэш уникальных названий источников для гибридного поиска по title
 _bm25_index = None
 _bm25_chunks = None  # параллельный список dict-ов чанков (тот же порядок, что в BM25-индексе)
+_reranker = None
 
 
 def _pick_device() -> str:
@@ -73,6 +88,13 @@ def _get_model():
     if _model is None:
         _model = SentenceTransformer(MODEL_NAME, device=_pick_device())
     return _model
+
+
+def _get_reranker() -> CrossEncoder:
+    global _reranker
+    if _reranker is None:
+        _reranker = CrossEncoder(RERANKER_MODEL_NAME, device=_pick_device(), max_length=512)
+    return _reranker
 
 
 def _get_collection():
@@ -196,6 +218,47 @@ def adaptive_k(scores: list[float], k_min: int = 3, k_max: int | None = None, ma
         if scores[i] < floor:
             return i
     return n
+
+
+def adaptive_k_relative(
+    scores: list[float], k_min: int = 3, k_max: int | None = None, ratio: float = 0.3
+) -> int:
+    """Аналог adaptive_k, но для оценок reranker'а: держим чанки, пока их
+    оценка не опустится ниже ratio * лучшая_оценка (мультипликативный порог),
+    а не margin в абсолютных единицах.
+
+    Reranker выдаёт sigmoid-подобные оценки с резким разбросом (0.01-0.99 —
+    не плавная косинусная похожесть 0.55-0.85, на которую откалиброван
+    adaptive_k выше). Абсолютный отступ margin=0.05 либо отрезал бы почти всё
+    (top=0.99, второй релевантный=0.85 — уже за порогом), либо, наоборот,
+    пропускал бы явно нерелевантные хвосты при низком top-score. Откалибровано
+    эмпирически на реальных примерах трёх типов вопросов (широкий "перечисли
+    примархов", узкий с одним лояльным чанком, узкий с множеством релевантных
+    чанков) — ratio=0.3 давал разумную отсечку во всех трёх случаях."""
+    n = len(scores) if k_max is None else min(len(scores), k_max)
+    if n <= k_min:
+        return n
+    floor = scores[0] * ratio
+    for i in range(k_min, n):
+        if scores[i] < floor:
+            return i
+    return n
+
+
+def rerank(query: str, chunks: list[dict]) -> list[dict]:
+    """Пересчитывает 'score' каждого чанка через cross-encoder reranker
+    (пара вопрос+текст оцениваются моделью совместно, не раздельным
+    кодированием как в dense-поиске) и возвращает тот же список, отсортированный
+    по новой оценке по убыванию. Заменяет собой ad hoc-подстраховки типа
+    _title_match_chunks/_stem одним универсальным механизмом — reranker сам
+    разбирается и с точным совпадением имени, и со смысловым сходством, без
+    необходимости вручную ловить каждый новый edge-case (см. модуль docstring)."""
+    if not chunks:
+        return chunks
+    model = _get_reranker()
+    scores = model.predict([(query, c["text"]) for c in chunks])
+    reranked = sorted(zip(scores, chunks), key=lambda pair: -pair[0])
+    return [{**c, "score": float(s)} for s, c in reranked]
 
 
 def _meta_to_chunk(text: str, meta: dict, score: float) -> dict:
