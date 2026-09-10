@@ -2,7 +2,13 @@
 
 top-k поиск релевантных чанков в ChromaDB по запросу пользователя.
 Модель эмбеддингов должна совпадать с той, что использовалась при индексации
-(intfloat/multilingual-e5-base) — иначе векторные пространства несовместимы.
+(intfloat/multilingual-e5-large) — иначе векторные пространства несовместимы.
+
+Апгрейд с e5-base (2026-09-10): e5-large заметно точнее на русском, в частности
+сама, без гибридного поиска по названию, находит источники по точному совпадению
+темы (см. _title_match_chunks ниже — тот костыль остаётся как подстраховка, но
+нагрузка на него теперь меньше). Старая коллекция 'horus_heresy' (e5-base)
+оставлена в data/chroma_db на случай отката, не используется активным кодом.
 """
 import os
 from pathlib import Path
@@ -13,8 +19,8 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 
 CHROMA_DIR = Path(__file__).resolve().parent.parent / "data" / "chroma_db"
-COLLECTION_NAME = "horus_heresy"
-MODEL_NAME = "intfloat/multilingual-e5-base"
+COLLECTION_NAME = "horus_heresy_e5large"
+MODEL_NAME = "intfloat/multilingual-e5-large"
 
 _model = None
 _collection = None

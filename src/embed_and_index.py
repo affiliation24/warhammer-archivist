@@ -1,8 +1,10 @@
 """Эмбеддинги + заливка в ChromaDB (Этапы 4-5 roadmap).
 
-Модель: intfloat/multilingual-e5-base — лучший баланс качества на русском
-и скорости для CPU/MPS без внешнего GPU (e5-large точнее, но на ~27k чанков
-на Apple Silicon это будет заметно дольше; base хватает с запасом для MVP).
+Модель: intfloat/multilingual-e5-large — точнее e5-base на русском (в 2 раза
+больше параметров), но и заметно медленнее считать. Апгрейд с base сделан
+через НОВУЮ коллекцию (другая размерность вектора: 1024 против 768 у base —
+несовместимы, инкрементально дополнить старую нельзя), поэтому здесь
+полный пересчёт эмбеддингов для всех чанков, а не только новых.
 
 e5-модели требуют префикса "query: "/"passage: " перед текстом — это часть
 их протокола обучения, а не опция.
@@ -15,10 +17,10 @@ from sentence_transformers import SentenceTransformer
 
 CHUNKS_PATH = Path(__file__).resolve().parent.parent / "data" / "processed" / "chunks.jsonl"
 CHROMA_DIR = Path(__file__).resolve().parent.parent / "data" / "chroma_db"
-COLLECTION_NAME = "horus_heresy"
-MODEL_NAME = "intfloat/multilingual-e5-base"
+COLLECTION_NAME = "horus_heresy_e5large"
+MODEL_NAME = "intfloat/multilingual-e5-large"
 
-EMBED_BATCH = 64
+EMBED_BATCH = 32  # ниже, чем у base (64) — e5-large тяжелее, экономим пиковую память на 8 ГБ RAM
 CHROMA_BATCH = 500
 
 
