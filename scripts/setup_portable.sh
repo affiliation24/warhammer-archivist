@@ -20,10 +20,14 @@ if [ ! -d "$1" ]; then
     exit 1
 fi
 
-echo "==> Копирую код и конфиг"
+echo "==> Копирую код, конфиг и лаунчеры (двойной клик — не нужно вручную набирать команды)"
 mkdir -p "$TARGET/data/processed"
 cp -R "$PROJECT_ROOT/src" "$TARGET/"
+cp -R "$PROJECT_ROOT/scripts" "$TARGET/"
 cp "$PROJECT_ROOT/requirements.txt" "$TARGET/"
+cp "$PROJECT_ROOT/Warhammer Chat.command" "$TARGET/"
+chmod +x "$TARGET/Warhammer Chat.command"
+cp "$PROJECT_ROOT/Warhammer Chat.bat" "$TARGET/"
 if [ -f "$PROJECT_ROOT/.env" ]; then
     cp "$PROJECT_ROOT/.env" "$TARGET/"
 else
@@ -51,4 +55,4 @@ python3 -m venv --copies "$TARGET/.venv"
 "$TARGET/.venv/bin/pip" install --quiet -r "$TARGET/requirements.txt"
 
 echo "==> Готово: $TARGET"
-echo "    Запуск на новом Mac: cd '$TARGET/src' && ../.venv/bin/python chat.py"
+echo "    Запуск на новом Mac (Apple Silicon): дважды кликни 'Warhammer Chat.command' на флешке"

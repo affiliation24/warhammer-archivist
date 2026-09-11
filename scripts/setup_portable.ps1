@@ -71,6 +71,6 @@ foreach ($model in @("models--intfloat--multilingual-e5-large", "models--BAAI--b
 
 Write-Host ""
 Write-Host "==> Готово: $VenvPath"
-Write-Host "    Запуск: cd '$Target\src'; & '$PyExe' chat.py"
+Write-Host "    Запуск: дважды кликни 'Warhammer Chat.bat' в '$Target'"
 Write-Host ""
 Write-Host "    Перед тем как вынимать флешку — запусти scripts\end_session.ps1 -Drive $Drive"
