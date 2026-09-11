@@ -1,12 +1,13 @@
-"""Оформление CLI: зелёный текст (ANSI) + звуковое сопровождение (afplay, macOS).
+"""Оформление CLI: зелёный текст (ANSI) + звуковое сопровождение (afplay на
+macOS, PowerShell/WPF MediaPlayer на Windows, первый найденный из mpg123/
+ffplay/mpv/cvlc на Linux — см. _sound_player_cmd).
 
-Звуковые файлы кладутся в sounds/ в корне проекта под именами ниже. Если файла нет —
-звук просто не проигрывается (никаких ошибок), так что бот работает и без них.
+Звуковые файлы кладутся в sounds/ в корне проекта под именами ниже. Если файла нет,
+или на этой ОС не нашлось ни одного проигрывателя — звук просто не проигрывается
+(никаких ошибок), так что бот работает и без них.
 """
-import os
 import random
 import shutil
-import signal
 import subprocess
 import sys
 import termios
@@ -117,7 +118,51 @@ SOUND_FILES = {
 # фоновая музыка, зацикленная на всё время работы CLI
 BACKGROUND_MUSIC_FILE = SOUNDS_DIR / "warhammer_40000_mechanicus_02_Caestus_Metalican.mp3"
 
-_background_process: subprocess.Popen | None = None
+# PowerShell-скрипт для Windows: WPF MediaPlayer умеет mp3 из коробки (в
+# отличие от System.Media.SoundPlayer, который только wav), но не отдаёт
+# длительность сразу после Open() — она подгружается асинхронно, поэтому
+# ждём HasTimeSpan в цикле перед тем как ждать реального времени трека.
+_WINDOWS_PLAY_SCRIPT = (
+    "Add-Type -AssemblyName presentationCore; "
+    "$p = New-Object system.windows.media.mediaplayer; "
+    "$p.Open([uri]'{path}'); "
+    "while (-not $p.NaturalDuration.HasTimeSpan) {{ Start-Sleep -Milliseconds 100 }}; "
+    "$p.Play(); "
+    "Start-Sleep -Seconds ([math]::Ceiling($p.NaturalDuration.TimeSpan.TotalSeconds)); "
+    "$p.Stop()"
+)
+
+# Линуксовые дистрибутивы не гарантируют общего проигрывателя "из коробки" —
+# перебираем то, что реально может стоять, и берём первое найденное.
+_LINUX_PLAYERS = (
+    ("mpg123", ["-q"]),
+    ("ffplay", ["-nodisp", "-autoexit", "-loglevel", "quiet"]),
+    ("mpv", ["--no-video", "--really-quiet"]),
+    ("cvlc", ["--play-and-exit", "-q"]),
+)
+
+
+def _sound_player_cmd(path: str) -> list[str] | None:
+    """Команда для одноразового (блокирующего до конца трека) воспроизведения
+    файла на этой ОС, или None, если подходящего плеера не нашлось —
+    воспроизведение тогда молча пропускается, как и при отсутствии самого
+    файла (см. модульный docstring)."""
+    if sys.platform == "darwin":
+        return ["afplay", path]
+    if sys.platform == "win32":
+        script = _WINDOWS_PLAY_SCRIPT.format(path=path.replace("'", "''"))
+        return ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", script]
+    for player, args in _LINUX_PLAYERS:
+        found = shutil.which(player)
+        if found:
+            return [found, *args, path]
+    return None
+
+
+_background_stop: threading.Event | None = None
+_background_thread: threading.Thread | None = None
+_background_proc: subprocess.Popen | None = None
+_background_lock = threading.Lock()
 
 
 def clear_screen() -> None:
@@ -345,27 +390,28 @@ def render_sources(chunks: list[dict]) -> str:
 
 def play_sound(event: str) -> None:
     """Проигрывает звук для события в фоне, не блокируя CLI. Тихо ничего не делает,
-    если подходящего файла нет (пользователь ещё не положил звуки в sounds/)."""
+    если подходящего файла нет или на этой ОС не нашлось проигрывателя."""
     base_name = SOUND_FILES.get(event)
     if not base_name or not SOUNDS_DIR.exists():
         return
     for path in SOUNDS_DIR.glob(f"{base_name}.*"):
+        cmd = _sound_player_cmd(str(path))
+        if cmd is None:
+            return
         try:
-            subprocess.Popen(
-                ["afplay", str(path)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except FileNotFoundError:
-            pass  # afplay недоступен (не macOS) — просто пропускаем
+            pass  # проигрыватель пропал между which() и запуском — крайне маловероятно, но не критично
         return
 
 
 def kill_orphaned_background_music() -> None:
     """Убивает "осиротевшие" процессы фоновой музыки от прошлых сессий, которые
     не завершились штатно (например, окно терминала закрыли напрямую, минуя
-    /exit — тогда finally в chat.py не успевает отработать, и цикл afplay
-    остаётся висеть в фоне навсегда, т.к. запущен в своей сессии)."""
+    /exit — тогда finally в chat.py не успевает отработать). pkill есть на
+    macOS и обычно на Linux; на Windows его нет — тихо пропускаем, там
+    осиротевший процесс не так критичен (закрытие окна терминала обычно и
+    завершает дочерний powershell)."""
     try:
         subprocess.run(
             ["pkill", "-f", str(BACKGROUND_MUSIC_FILE)],
@@ -373,36 +419,59 @@ def kill_orphaned_background_music() -> None:
             stderr=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        pass  # pkill недоступен — просто пропускаем
+        pass  # pkill недоступен (Windows) — просто пропускаем
 
 
 def start_background_music() -> None:
-    """Запускает фоновую музыку на репите в отдельном процессе (shell-цикл вокруг
-    afplay — сам afplay не умеет зацикливать). Не блокирует CLI. Тихо ничего не
-    делает, если файла нет или afplay недоступен."""
-    global _background_process
+    """Запускает фоновую музыку на репите в фоновом потоке (не shell-цикле —
+    команда воспроизведения разная на каждой ОС, см. _sound_player_cmd).
+    Не блокирует CLI. Тихо ничего не делает, если файла нет или на этой ОС
+    не нашлось проигрывателя."""
+    global _background_stop, _background_thread
     if not BACKGROUND_MUSIC_FILE.exists():
         return
+    cmd = _sound_player_cmd(str(BACKGROUND_MUSIC_FILE))
+    if cmd is None:
+        return
     kill_orphaned_background_music()
-    try:
-        _background_process = subprocess.Popen(
-            ["sh", "-c", f'while true; do afplay "{BACKGROUND_MUSIC_FILE}"; done'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except FileNotFoundError:
-        pass
+
+    _background_stop = threading.Event()
+
+    def _loop(stop_event: threading.Event) -> None:
+        global _background_proc
+        while True:
+            with _background_lock:
+                if stop_event.is_set():
+                    return
+                try:
+                    _background_proc = subprocess.Popen(
+                        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    )
+                except FileNotFoundError:
+                    return
+            _background_proc.wait()
+
+    _background_thread = threading.Thread(target=_loop, args=(_background_stop,), daemon=True)
+    _background_thread.start()
 
 
 def stop_background_music() -> None:
-    global _background_process
-    if _background_process is None:
+    """Останавливает музыку и гарантированно не оставляет висящий процесс:
+    _background_lock синхронизирует это с _loop() выше — иначе возможна
+    гонка (проверили stop_event, ещё не успели запустить/сохранить в
+    _background_proc новый процесс — а stop() тем временем уже прочитал
+    старое значение и завершился, новый процесс остаётся играть трек
+    до конца, никем не остановленный)."""
+    global _background_stop, _background_thread, _background_proc
+    if _background_stop is None:
         return
-    try:
-        # процесс — обёртка "sh -c 'while true; do afplay ...; done'";
-        # убиваем всю группу, иначе останется висеть текущий afplay внутри цикла
-        os.killpg(os.getpgid(_background_process.pid), signal.SIGTERM)
-    except (ProcessLookupError, PermissionError):
-        pass
-    _background_process = None
+    with _background_lock:
+        _background_stop.set()
+        if _background_proc is not None:
+            try:
+                _background_proc.terminate()
+            except (ProcessLookupError, PermissionError):
+                pass
+    _background_stop = None
+    _background_thread = None
+    _background_proc = None
