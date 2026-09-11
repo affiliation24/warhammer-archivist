@@ -2,6 +2,7 @@
 import random
 import select
 import sys
+import time
 
 from generator import ERA_LABELS, AccessDeniedError, EraClarificationNeeded, TokensExhaustedError, answer
 from retriever import BOOT_STAGES, warm_up
@@ -124,22 +125,42 @@ def _drain_pasted_lines() -> int:
 def _boot() -> None:
     """Явно прогревает модели/индексы с индикацией прогресса по этапам —
     без этого холодная загрузка (особенно с медленного носителя) молча висит
-    на первом вопросе, и непонятно, идёт загрузка или терминал завис."""
+    на первом вопросе, и непонятно, идёт загрузка или терминал завис.
+
+    Проценты — не реальный прогресс байт (модели не отдают такой колбэк), а
+    интерполяция по ожидаемой длительности каждого этапа (EXPECTED_SECONDS,
+    грубая прикидка: reranker и BM25-индекс заметно дольше остальных). На
+    саму смену этапа это не влияет — она наступает по факту завершения
+    соответствующего вызова в warm_up(), интерполяция только сглаживает
+    процент внутри текущего этапа между двумя такими фактическими сменами."""
     labels = [label for _, label in BOOT_STAGES]
+    expected_seconds = [1.0, 4.0, 5.0, 90.0]
+    total_seconds = sum(expected_seconds)
+    cumulative_before = [sum(expected_seconds[:i]) for i in range(len(expected_seconds))]
+
     current = [0]
+    stage_started_at = [time.monotonic()]
+
+    def percent_now() -> float:
+        elapsed = time.monotonic() - stage_started_at[0]
+        expected = expected_seconds[current[0]]
+        frac = min(elapsed / expected, 0.97) if expected > 0 else 0.97
+        done_seconds = cumulative_before[current[0]] + expected * frac
+        return done_seconds / total_seconds * 100
 
     spin_stop, spin_thread = start_spinner(
-        lambda frame: _redraw(render_boot_stages(labels, current[0], frame))
+        lambda frame: _redraw(render_boot_stages(labels, current[0], frame, percent_now()))
     )
 
     def on_stage(stage_key: str) -> None:
         current[0] = next(i for i, (key, _) in enumerate(BOOT_STAGES) if key == stage_key)
+        stage_started_at[0] = time.monotonic()
 
     try:
         warm_up(on_stage=on_stage)
     finally:
         stop_spinner(spin_stop, spin_thread)
-    _redraw(render_boot_stages(labels, len(labels)))
+    _redraw(render_boot_stages(labels, len(labels), percent=100.0))
 
 
 def main():

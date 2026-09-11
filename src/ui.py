@@ -135,12 +135,28 @@ def dim(text: str) -> str:
     return f"{DIM_GREEN}{text}{RESET}"
 
 
-def render_boot_stages(stages: list[str], current: int, frame: str = "⠋") -> str:
+_PROGRESS_LINE_WIDTH = 56  # под ширину строки боевого баннера ниже
+
+
+def render_progress_bar(percent: float, width: int = 24) -> str:
+    """Полоска загрузки вида [▓▓▓▓░░░░] NN% — выровнена по правому краю
+    строки фиксированной ширины (см. _PROGRESS_LINE_WIDTH), чтобы смотреться
+    как HUD-индикатор, а не просто текст в подвале."""
+    percent = max(0.0, min(100.0, percent))
+    filled = int(round(width * percent / 100))
+    bar_plain = f"[{'▓' * filled}{'░' * (width - filled)}]"
+    percent_plain = f" {percent:3.0f}%"
+    pad = max(0, _PROGRESS_LINE_WIDTH - len(bar_plain) - len(percent_plain))
+    return f"{' ' * pad}{BRASS}{bar_plain}{RESET}{BONE}{percent_plain}{RESET}"
+
+
+def render_boot_stages(stages: list[str], current: int, frame: str = "⠋", percent: float = 0.0) -> str:
     """Список этапов прогрева (загрузка моделей/индексов) при холодном старте —
     пройденные помечены галочкой, текущий крутится спиннером, остальные
-    приглушены. Без этого холодная загрузка (особенно с медленного носителя,
-    вроде внешней флешки) выглядит как зависший терминал: reranker и
-    e5-large вместе весят несколько GB и могут грузиться десятки секунд."""
+    приглушены, справа — общая полоска прогресса с процентами. Без этого
+    холодная загрузка (особенно с медленного носителя, вроде внешней флешки)
+    выглядит как зависший терминал: reranker и e5-large вместе весят
+    несколько GB и могут грузиться десятки секунд."""
     lines = [f"{BONE}Пробуждение Машинного Духа...{RESET}", ""]
     for i, label in enumerate(stages):
         if i < current:
@@ -149,6 +165,8 @@ def render_boot_stages(stages: list[str], current: int, frame: str = "⠋") -> s
             lines.append(f"{BONE}  {frame} {label}...{RESET}")
         else:
             lines.append(dim(f"    {label}"))
+    lines.append("")
+    lines.append(render_progress_bar(percent))
     return "\n".join(lines)
 
 
