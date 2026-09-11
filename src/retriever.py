@@ -43,6 +43,11 @@ import re
 from pathlib import Path
 
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+# Кэш моделей — рядом с проектом, а не в домашней папке пользователя: если
+# запускать с флешки/переносного носителя, веса моделей не должны оседать на
+# диске хост-машины. Должно быть выставлено до первого импорта huggingface_hub/
+# sentence_transformers, иначе библиотека уже выберет путь по умолчанию.
+os.environ.setdefault("HF_HOME", str(Path(__file__).resolve().parent.parent / "hf_cache"))
 
 import chromadb
 import torch
@@ -243,6 +248,34 @@ def adaptive_k_relative(
         if scores[i] < floor:
             return i
     return n
+
+
+BOOT_STAGES = (
+    ("chroma", "Активация архивной базы данных"),
+    ("dense", "Инициализация нейросети эмбеддингов"),
+    ("bm25", "Синхронизация BM25-индекса"),
+    ("reranker", "Калибровка когнитивного фильтра"),
+)
+
+
+def warm_up(on_stage=None) -> None:
+    """Явно загружает все модели/индексы по порядку вместо ленивой загрузки
+    по требованию — иначе холодная загрузка (первый запрос) молча висит на
+    спиннере "Машинный Дух обрабатывает запрос", и непонятно, идёт загрузка
+    моделей (десятки секунд-минуты на медленном носителе) или что-то зависло.
+    on_stage(stage_key), если передан, вызывается перед началом каждого этапа
+    из BOOT_STAGES — используется для отрисовки прогресса в chat.py."""
+    for stage_key, _ in BOOT_STAGES:
+        if on_stage:
+            on_stage(stage_key)
+        if stage_key == "chroma":
+            _get_collection()
+        elif stage_key == "dense":
+            _get_model()
+        elif stage_key == "bm25":
+            _get_bm25()
+        elif stage_key == "reranker":
+            _get_reranker()
 
 
 def rerank(query: str, chunks: list[dict]) -> list[dict]:

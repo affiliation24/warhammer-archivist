@@ -10,7 +10,13 @@ e5-модели требуют префикса "query: "/"passage: " перед
 их протокола обучения, а не опция.
 """
 import json
+import os
 from pathlib import Path
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+# Кэш моделей — рядом с проектом, а не в домашней папке пользователя: см.
+# аналогичную настройку и комментарий в retriever.py.
+os.environ.setdefault("HF_HOME", str(Path(__file__).resolve().parent.parent / "hf_cache"))
 
 import chromadb
 from sentence_transformers import SentenceTransformer

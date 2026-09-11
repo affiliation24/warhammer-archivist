@@ -4,6 +4,7 @@ import select
 import sys
 
 from generator import ERA_LABELS, AccessDeniedError, EraClarificationNeeded, TokensExhaustedError, answer
+from retriever import BOOT_STAGES, warm_up
 from ui import (
     DULL_BRASS,
     RESET,
@@ -12,6 +13,7 @@ from ui import (
     green,
     play_sound,
     render_banner,
+    render_boot_stages,
     render_sources,
     select_menu,
     show_splash,
@@ -119,9 +121,31 @@ def _drain_pasted_lines() -> int:
     return drained
 
 
+def _boot() -> None:
+    """Явно прогревает модели/индексы с индикацией прогресса по этапам —
+    без этого холодная загрузка (особенно с медленного носителя) молча висит
+    на первом вопросе, и непонятно, идёт загрузка или терминал завис."""
+    labels = [label for _, label in BOOT_STAGES]
+    current = [0]
+
+    spin_stop, spin_thread = start_spinner(
+        lambda frame: _redraw(render_boot_stages(labels, current[0], frame))
+    )
+
+    def on_stage(stage_key: str) -> None:
+        current[0] = next(i for i, (key, _) in enumerate(BOOT_STAGES) if key == stage_key)
+
+    try:
+        warm_up(on_stage=on_stage)
+    finally:
+        stop_spinner(spin_stop, spin_thread)
+    _redraw(render_boot_stages(labels, len(labels)))
+
+
 def main():
     play_sound("startup")
     show_splash()
+    _boot()
     _redraw()
     start_background_music()
     last_chunks = []

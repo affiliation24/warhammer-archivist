@@ -135,6 +135,23 @@ def dim(text: str) -> str:
     return f"{DIM_GREEN}{text}{RESET}"
 
 
+def render_boot_stages(stages: list[str], current: int, frame: str = "⠋") -> str:
+    """Список этапов прогрева (загрузка моделей/индексов) при холодном старте —
+    пройденные помечены галочкой, текущий крутится спиннером, остальные
+    приглушены. Без этого холодная загрузка (особенно с медленного носителя,
+    вроде внешней флешки) выглядит как зависший терминал: reranker и
+    e5-large вместе весят несколько GB и могут грузиться десятки секунд."""
+    lines = [f"{BONE}Пробуждение Машинного Духа...{RESET}", ""]
+    for i, label in enumerate(stages):
+        if i < current:
+            lines.append(f"{BRASS}  ✓ {label}{RESET}")
+        elif i == current:
+            lines.append(f"{BONE}  {frame} {label}...{RESET}")
+        else:
+            lines.append(dim(f"    {label}"))
+    return "\n".join(lines)
+
+
 def _spaced(text: str, letter_gap: int = LETTER_GAP, word_gap: int = WORD_GAP) -> str:
     """Разрядка текста: letter_gap пробелов между буквами, word_gap — между словами."""
     return (" " * word_gap).join((" " * letter_gap).join(word) for word in text.split(" "))
