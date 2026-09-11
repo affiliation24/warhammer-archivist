@@ -258,6 +258,19 @@ BOOT_STAGES = (
 )
 
 
+def models_cached() -> bool:
+    """True, если веса эмбеддингов и reranker'а уже лежат в HF-кэше (HF_HOME) —
+    тогда прогрев займёт секунды и не нуждается в отдельном экране прогресса.
+    False — первый запуск на новой машине, модели ещё нужно скачать (может
+    занять минуты), explicit warm_up с прогресс-баром в chat.py оправдан."""
+    hf_hub = Path(os.environ["HF_HOME"]) / "hub"
+    for name in (MODEL_NAME, RERANKER_MODEL_NAME):
+        snapshots = hf_hub / f"models--{name.replace('/', '--')}" / "snapshots"
+        if not snapshots.is_dir() or not any(snapshots.iterdir()):
+            return False
+    return True
+
+
 def warm_up(on_stage=None) -> None:
     """Явно загружает все модели/индексы по порядку вместо ленивой загрузки
     по требованию — иначе холодная загрузка (первый запрос) молча висит на

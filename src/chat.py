@@ -5,7 +5,7 @@ import sys
 import time
 
 from generator import ERA_LABELS, AccessDeniedError, EraClarificationNeeded, TokensExhaustedError, answer
-from retriever import BOOT_STAGES, warm_up
+from retriever import BOOT_STAGES, models_cached, warm_up
 from ui import (
     DULL_BRASS,
     RESET,
@@ -166,7 +166,12 @@ def _boot() -> None:
 def main():
     play_sound("startup")
     show_splash()
-    _boot()
+    # Экран прогрева с прогресс-баром показываем только на холодном старте
+    # (первый запуск на новой машине, модели ещё не скачаны) — если веса уже
+    # в кэше, прогрев занимает секунды и молча происходит при первом вопросе,
+    # отдельный экран тут был бы лишним ритуалом на каждый обычный запуск.
+    if not models_cached():
+        _boot()
     _redraw()
     start_background_music()
     last_chunks = []
