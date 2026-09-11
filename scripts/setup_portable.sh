@@ -58,6 +58,15 @@ else
     cp "$PROJECT_ROOT/data/processed/chunks.jsonl" "$TARGET/data/processed/"
 fi
 
+if [ -d "$PROJECT_ROOT/sounds" ]; then
+    if [ -d "$TARGET/sounds" ]; then
+        echo "==> Звук/музыка уже на флешке — пропускаю"
+    else
+        echo "==> Копирую звук и фоновую музыку"
+        cp -R "$PROJECT_ROOT/sounds" "$TARGET/"
+    fi
+fi
+
 echo "==> Копирую кэш моделей (multilingual-e5-large, bge-reranker-v2-m3)"
 HF_SRC="${HF_HOME:-$HOME/.cache/huggingface}/hub"
 mkdir -p "$TARGET/hf_cache/hub"
