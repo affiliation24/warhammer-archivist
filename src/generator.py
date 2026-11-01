@@ -1,4 +1,4 @@
-"""Интеграция с Groq API (Этап 7 roadmap).
+"""Интеграция с DeepSeek API (OpenAI-совместимый протокол).
 
 Промпт зафиксирован на анти-галлюцинацию: модель отвечает только на основе
 контекста из retrieval, при нехватке данных прямо говорит об этом.
@@ -7,11 +7,12 @@ import os
 import random
 
 from dotenv import load_dotenv
-from groq import (
+from openai import (
     APIConnectionError,
     APITimeoutError,
-    Groq,
+    AuthenticationError,
     InternalServerError,
+    OpenAI,
     PermissionDeniedError,
     RateLimitError,
 )
@@ -21,7 +22,7 @@ from retriever import adaptive_k_relative, rerank, retrieve
 
 
 class TokensExhaustedError(RuntimeError):
-    """Исчерпан бесплатный лимит токенов/запросов Groq (RateLimitError, код 429)."""
+    """Исчерпан лимит запросов/токенов DeepSeek (RateLimitError, код 429)."""
 
 
 ERA_HERESY = "heresy"
@@ -80,7 +81,7 @@ class EraClarificationNeeded(RuntimeError):
 class AccessDeniedError(RuntimeError):
     """Стабильный отказ доступа (403) после нескольких повторов — не квота,
     а что-то на уровне сети/аккаунта (например временная блокировка на стороне
-    сети/CDN, а не самого Groq)."""
+    сети/CDN, а не самого DeepSeek)."""
 
 
 TECHPRIEST_QUOTA_MESSAGES = (
@@ -127,11 +128,12 @@ TECHPRIEST_ACCESS_DENIED_MESSAGE = (
 
 load_dotenv()
 
-GROQ_MODEL = "openai/gpt-oss-120b"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
 
 # Потолок числа чанков в контексте независимо от того, что предложит adaptive_k.
-# Бесплатный тир Groq ограничен по токенам в минуту (TPM); без потолка широкий
-# вопрос мог забрать весь пул (25+ чанков) и упереться в лимит запросом 413.
+# DeepSeek тарифицируется по токенам; без потолка широкий вопрос мог забрать
+# весь пул (25+ чанков) и упереться в лимит размера контекста запросом 413.
 MAX_CONTEXT_CHUNKS = 12
 
 # Порог скора reranker'а (сигмоида, 0..1), ниже которого лучший найденный чанк
@@ -142,14 +144,12 @@ MAX_CONTEXT_CHUNKS = 12
 # среди шумовых кандидатов случайно затесались чанки из разных эпох.
 MIN_RELEVANCE_SCORE = 0.1
 
-# Для исправления опечаток нужна основная модель, не лёгкая: пробовал
-# "openai/gpt-oss-20b" для скорости — не справилась со специфичной терминологией
-# сеттинга (например, не восстановила "приархов" -> "примархов", а иногда даже
-# портила слово сильнее). Строковые метрики (Levenshtein, difflib) тоже не
-# подошли: на коротких словах домена ("Дети"/"Детей" — падеж, легитимно;
-# "Хорус"/"Хорст" — разные слова) они дают одинаковые числа, надёжного порога
-# не существует. Основная модель с доменным контекстом в промпте справляется.
-CORRECTION_MODEL = GROQ_MODEL
+# Для исправления опечаток используем ту же основную модель DeepSeek.
+# Строковые метрики (Levenshtein, difflib) не подошли: на коротких словах домена
+# ("Дети"/"Детей" — падеж, легитимно; "Хорус"/"Хорст" — разные слова) они дают
+# одинаковые числа, надёжного порога не существует. Основная модель с доменным
+# контекстом в промпте справляется.
+CORRECTION_MODEL = DEEPSEEK_MODEL
 
 CORRECTION_PROMPT = """Ты — модуль исправления опечаток перед поиском в архиве по
 вселенной Warhammer 40000. Тебе дают вопрос пользователя с возможными
@@ -175,14 +175,14 @@ CORRECTION_PROMPT = """Ты — модуль исправления опечат
 
 
 def correct_typos(question: str) -> str:
-    """Просит Groq исправить опечатки в вопросе перед его использованием для
+    """Просит DeepSeek исправить опечатки в вопросе перед его использованием для
     поиска. Любая ошибка (нет ключа, сеть, лимит) — тихий откат к оригиналу,
     коррекция не критична для работы бота."""
-    api_key = os.environ.get("GROQ_API_KEY")
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         return question
     try:
-        client = Groq(api_key=api_key)
+        client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
         resp = client.chat.completions.create(
             model=CORRECTION_MODEL,
             messages=[
@@ -277,10 +277,10 @@ def build_context(chunks: list[dict]) -> str:
     wait=wait_exponential(multiplier=1, min=2, max=30),
     reraise=True,
 )
-def _call_groq(client: Groq, messages: list[dict]) -> str:
+def _call_deepseek(client: OpenAI, messages: list[dict]) -> str:
     try:
         resp = client.chat.completions.create(
-            model=GROQ_MODEL,
+            model=DEEPSEEK_MODEL,
             messages=messages,
             temperature=0.2,
             max_tokens=2048,
@@ -298,13 +298,13 @@ def _call_groq(client: Groq, messages: list[dict]) -> str:
 def answer(
     question: str, k: int = 6, era_chunks_override: list[dict] | None = None
 ) -> tuple[str, list[dict]]:
-    api_key = os.environ.get("GROQ_API_KEY")
+    api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError(
-            "GROQ_API_KEY не найден. Создай .env в корне проекта со строкой "
-            "GROQ_API_KEY=твой_ключ (получить на https://console.groq.com/keys)"
+            "DEEPSEEK_API_KEY не найден. Создай .env в корне проекта со строкой "
+            "DEEPSEEK_API_KEY=твой_ключ (получить на https://platform.deepseek.com/api_keys)"
         )
-    client = Groq(api_key=api_key)
+    client = OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
 
     if era_chunks_override is not None:
         # пользователь уже выбрал эпоху после уточняющего вопроса — используем
@@ -343,11 +343,16 @@ def answer(
     ]
 
     try:
-        reply = _call_groq(client, messages)
+        reply = _call_deepseek(client, messages)
     except PermissionDeniedError as e:
-        # retry= в _call_groq уже исчерпал попытки на этом моменте —
+        # retry= в _call_deepseek уже исчерпал попытки на этом моменте —
         # значит отказ стабильный, сообщаем пользователю понятно
         raise AccessDeniedError(TECHPRIEST_ACCESS_DENIED_MESSAGE) from e
+    except AuthenticationError as e:
+        raise RuntimeError(
+            "Ключ DeepSeek отклонён (401). Проверьте DEEPSEEK_API_KEY в .env — "
+            "возможно, в нём опечатка или ключ был отозван."
+        ) from e
     return strip_markdown(reply), chunks
 
 

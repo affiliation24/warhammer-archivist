@@ -7,14 +7,24 @@ ffplay/mpv/cvlc на Linux — см. _sound_player_cmd).
 (никаких ошибок), так что бот работает и без них.
 """
 import random
+import re
 import shutil
 import subprocess
 import sys
-import termios
+import textwrap
 import threading
 import time
-import tty
 from pathlib import Path
+
+# termios/tty есть только в POSIX-системах (macOS/Linux). На Windows их нет,
+# поэтому импортируем условно — иначе бот вообще не запустился бы на Windows,
+# хотя Warhammer Chat.bat и setup_portable.ps1 заявлены. Вместо termios на
+# Windows используется msvcrt (см. read_key).
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import termios
+    import tty
 
 GREEN = "\033[92m"       # яркий зелёный — акценты, статусные фразы
 DARK_GREEN = "\033[32m"  # тёмный зелёный — основной текст ответов
@@ -287,7 +297,7 @@ def start_spinner(redraw_fn, interval: float = 0.15):
     """Запускает текстовую анимацию "мышления" в фоновом потоке — вызывает
     redraw_fn(frame) каждые interval секунд, пока не остановлена. frame — один
     символ вращающегося индикатора. Использовать только пока основной поток
-    занят чем-то блокирующим (например, ждёт ответ Groq) и не читает stdin —
+    занят чем-то блокирующим (например, ждёт ответ DeepSeek) и не читает stdin —
     иначе анимация будет мешать вводу. Возвращает (stop_event, thread);
     останавливать строго через stop_spinner() перед любым следующим выводом."""
     stop_event = threading.Event()
@@ -360,8 +370,62 @@ def select_menu(options: list, render_fn) -> int:
             return selected
 
 
+def wrap_text(text: str, width: int | None = None) -> str:
+    """Переносит текст по словам на ширину терминала — как это делает TUI-фреймворк
+    (в arc-academy-terminal за это отвечает ratatui Paragraph с Wrap): терминал по
+    умолчанию режет строку посередине слова, а здесь перенос выполняется по
+    границам слов, при этом пункты списков получают висячий отступ, чтобы
+    продолжение строки читалось как продолжение пункта.
+
+    Пустые строки и абзацы сохраняются. Слишком длинные «неразрывные» слова
+    (URL, код) не разбиваются — остаются выступать за край, это предпочтительнее
+    переноса посередине термина."""
+    if width is None:
+        width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    width = max(width, 20)
+
+    def _wrapper(**kwargs):
+        return textwrap.TextWrapper(
+            width=width,
+            break_long_words=False,
+            break_on_hyphens=False,
+            **kwargs,
+        )
+
+    lines: list[str] = []
+    for para in text.split("\n"):
+        stripped = para.lstrip()
+        if not stripped:
+            lines.append("")
+            continue
+        indent = para[: len(para) - len(stripped)]
+        if stripped.startswith(("- ", "• ", "· ", "* ")):
+            bullet = stripped[:2]
+            lines.extend(
+                _wrapper(initial_indent=indent + bullet, subsequent_indent=indent + "  ").wrap(
+                    stripped[2:].strip()
+                )
+            )
+        elif (m := re.match(r"^(\d+)([.)])\s+(.*)$", stripped)):
+            marker = f"{m.group(1)}{m.group(2)} "
+            lines.extend(
+                _wrapper(
+                    initial_indent=indent + marker,
+                    subsequent_indent=indent + " " * len(marker),
+                ).wrap(m.group(3).strip())
+            )
+        else:
+            lines.extend(
+                _wrapper(initial_indent=indent, subsequent_indent=indent).wrap(stripped)
+            )
+    return "\n".join(lines)
+
+
 def type_out(text: str, delay: float = TYPEWRITER_DELAY, color: str = DARK_GREEN) -> None:
-    """Печатает текст посимвольно с задержкой, эффект печатной машинки."""
+    """Печатает текст посимвольно с задержкой, эффект печатной машинки.
+    Перед печатью текст переносится по словам на ширину терминала (см. wrap_text),
+    чтобы терминал не разрезал слова посередине."""
+    text = wrap_text(text).rstrip("\n")
     sys.stdout.write(color)
     for ch in text:
         sys.stdout.write(ch)

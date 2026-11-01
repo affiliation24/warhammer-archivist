@@ -14,3 +14,6 @@ video/
 sounds/
 data/
 hf_cache/
+
+# Локальные настройки TUI-интерфейса
+terminal_config.json
