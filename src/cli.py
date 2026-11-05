@@ -38,11 +38,41 @@ COMMANDS_HINT = """
 
 EXIT_COMMANDS = ("/exit", "/quit")
 
+# Команды fallback-CLI — используются Tab-автодополнением readline.
+COMMANDS = ("/exit", "/quit", "/sources")
+
 FAREWELL = "Связь с терминалом прервана. Да пребудет с Вами Святая Омнисия."
 PROCESSING = "Машинный Дух обрабатывает запрос..."
 
 # Вопросы о личности бота и канонические ответы на них — в persona.py,
 # общие для CLI и TUI-интерфейсов.
+
+
+def _install_tab_completion() -> None:
+    """Автодополнение команд по Tab для встроенного input().
+
+    Работает через readline, который есть только на POSIX-системах; на Windows
+    модуль отсутствует — там Tab сохраняет стандартное поведение терминала.
+    """
+    try:
+        import readline
+    except ImportError:
+        return
+
+    def _complete(text: str, state: int) -> str | None:
+        matches = [cmd for cmd in COMMANDS if cmd.startswith(text)]
+        return matches[state] if state < len(matches) else None
+
+    readline.set_completer(_complete)
+    # Без этого «/» считается разделителем слова, и completer получает «s»
+    # вместо «/s» — команды с косой чертой не находятся.
+    readline.set_completer_delims(" \t\n")
+    # На macOS Python использует libedit, где «tab: complete» не привязывает
+    # Tab; GNU readline (Linux) понимает стандартный синтаксис.
+    if "libedit" in (readline.__doc__ or ""):
+        readline.parse_and_bind("bind ^I rl_complete")
+    else:
+        readline.parse_and_bind("tab: complete")
 
 
 def _redraw(body: str = "") -> None:
@@ -130,6 +160,7 @@ def _boot() -> None:
 
 
 def main():
+    _install_tab_completion()
     play_sound("startup")
     show_splash()
     # Экран прогрева с прогресс-баром показываем только на холодном старте

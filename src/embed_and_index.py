@@ -10,13 +10,15 @@ e5-модели требуют префикса "query: "/"passage: " перед
 их протокола обучения, а не опция.
 """
 import json
-import os
 from pathlib import Path
 
-os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-# Кэш моделей — рядом с проектом, а не в домашней папке пользователя: см.
-# аналогичную настройку и комментарий в retriever.py.
-os.environ.setdefault("HF_HOME", str(Path(__file__).resolve().parent.parent / "hf_cache"))
+# Вся настройка HF-окружения (HF_HOME рядом с проектом, авто-офлайн при
+# наличии весов в кэше, HF_TOKEN из .env) — в hf_env.py. Импортировать его
+# нужно до sentence_transformers, т.к. HF-библиотеки читают env в момент
+# собственного импорта.
+import hf_env
+
+hf_env.configure_hf_env()
 
 import chromadb
 from sentence_transformers import SentenceTransformer
@@ -24,7 +26,7 @@ from sentence_transformers import SentenceTransformer
 CHUNKS_PATH = Path(__file__).resolve().parent.parent / "data" / "processed" / "chunks.jsonl"
 CHROMA_DIR = Path(__file__).resolve().parent.parent / "data" / "chroma_db"
 COLLECTION_NAME = "horus_heresy_e5large"
-MODEL_NAME = "intfloat/multilingual-e5-large"
+MODEL_NAME = hf_env.MODEL_NAMES[0]  # intfloat/multilingual-e5-large — имя в одном месте, в hf_env.py
 
 EMBED_BATCH = 32  # ниже, чем у base (64) — e5-large тяжелее, экономим пиковую память на 8 ГБ RAM
 CHROMA_BATCH = 500

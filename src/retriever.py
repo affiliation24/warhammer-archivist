@@ -38,16 +38,16 @@ edge-case — reranker сам разбирается и с точным совп
 (плавная, 0.55-0.85), на которую был откалиброван adaptive_k(margin=...).
 """
 import json
-import os
 import re
 from pathlib import Path
 
-os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-# Кэш моделей — рядом с проектом, а не в домашней папке пользователя: если
-# запускать с флешки/переносного носителя, веса моделей не должны оседать на
-# диске хост-машины. Должно быть выставлено до первого импорта huggingface_hub/
-# sentence_transformers, иначе библиотека уже выберет путь по умолчанию.
-os.environ.setdefault("HF_HOME", str(Path(__file__).resolve().parent.parent / "hf_cache"))
+# Вся настройка HF-окружения (HF_HOME рядом с проектом, авто-офлайн при
+# наличии весов в кэше, HF_TOKEN из .env) — в hf_env.py. Импортировать его
+# нужно до sentence_transformers, т.к. HF-библиотеки читают env в момент
+# собственного импорта.
+import hf_env
+
+hf_env.configure_hf_env()
 
 import chromadb
 import torch
@@ -57,8 +57,9 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 CHROMA_DIR = Path(__file__).resolve().parent.parent / "data" / "chroma_db"
 CHUNKS_PATH = Path(__file__).resolve().parent.parent / "data" / "processed" / "chunks.jsonl"
 COLLECTION_NAME = "horus_heresy_e5large"
-MODEL_NAME = "intfloat/multilingual-e5-large"
-RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
+# Имена моделей определены в одном месте — в hf_env.MODEL_NAMES (там же они
+# проверяются по кэшу при авто-офлайне), здесь только удобные алиасы.
+MODEL_NAME, RERANKER_MODEL_NAME = hf_env.MODEL_NAMES
 
 RRF_K = 60  # стандартная константа RRF (см. оригинальную статью, дефолт Elasticsearch/OpenSearch)
 
@@ -263,12 +264,7 @@ def models_cached() -> bool:
     тогда прогрев займёт секунды и не нуждается в отдельном экране прогресса.
     False — первый запуск на новой машине, модели ещё нужно скачать (может
     занять минуты), explicit warm_up с прогресс-баром в chat.py оправдан."""
-    hf_hub = Path(os.environ["HF_HOME"]) / "hub"
-    for name in (MODEL_NAME, RERANKER_MODEL_NAME):
-        snapshots = hf_hub / f"models--{name.replace('/', '--')}" / "snapshots"
-        if not snapshots.is_dir() or not any(snapshots.iterdir()):
-            return False
-    return True
+    return hf_env.models_are_cached()
 
 
 def warm_up(on_stage=None) -> None:

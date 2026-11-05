@@ -246,7 +246,7 @@ _GREETING = random.choice(GREETING_VARIANTS)
 
 def render_banner() -> str:
     """Готик-индастриал баннер (без прямоугольной рамки): готическая арка сверху
-    и зеркально снизу, "клёпаный" разделитель, орнамент из шестерён/крестов.
+    и зеркально снизу, "клёпаный" разделитель, орнамент из шестерён.
     Возвращает уже раскрашенную (ANSI) многоцветную строку — не оборачивать
     в green(), цвета заданы построчно внутри. Ширина подбирается под контент
     и центрируется по ширине терминала."""
@@ -266,14 +266,13 @@ def render_banner() -> str:
         return f"{indent}{color}  •{body}•  {RESET}"
 
     def arch(flip: bool = False) -> list[str]:
-        apex = "✠"
         shoulders = ["╱   ╲", "╱       ╲", "╱           ╲"]
-        rows = [apex] + shoulders
+        rows = shoulders
         if flip:
             rows = rows[::-1]
         return [f"{indent}{IRON}{row.center(box_width)}{RESET}" for row in rows]
 
-    ornament = " ".join("⚙" if i % 2 == 0 else "✠" for i in range(7))
+    ornament = " ".join("⚙" for _ in range(7))
 
     rows = [
         *arch(),

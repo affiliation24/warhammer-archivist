@@ -100,6 +100,26 @@ THEME_DISPLAY_NAMES = {
 
 EXIT_COMMANDS = ("/exit", "/quit")
 
+# Команды чата в порядке перебора по Tab — используются автодополнением
+# в QuestionInput. Описания показываются в статусной строке при дополнении.
+COMMANDS = (
+    "/clear",
+    "/exit",
+    "/help",
+    "/quit",
+    "/sources",
+    "/theme",
+)
+
+COMMAND_DESCRIPTIONS = {
+    "/clear": "очистить журнал",
+    "/exit": "завершить сеанс",
+    "/help": "справка по клавишам",
+    "/quit": "завершить сеанс",
+    "/sources": "источники последнего ответа",
+    "/theme": "сменить тему",
+}
+
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "terminal_config.json"
 CONFIG_DEFAULTS = {
     "theme": "mechanicus",
@@ -185,11 +205,34 @@ def _build_input_bindings() -> list[Binding]:
     keep.append(Binding("ctrl+d", "app_scroll_log_down", "Вниз", show=False, priority=True))
     keep.append(Binding("up", "history_prev", "Предыдущий вопрос", show=False))
     keep.append(Binding("down", "history_next", "Следующий вопрос", show=False))
+    keep.append(Binding("tab", "complete_next", "Дополнить команду", show=False))
+    keep.append(Binding("shift+tab", "complete_prev", "Предыдущий вариант", show=False))
     return keep
 
 
 class QuestionInput(Input):
     BINDINGS = _build_input_bindings()
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._complete_base: str | None = None
+        self._complete_matches: list[str] = []
+        self._complete_idx: int = 0
+        self._complete_value: str | None = None
+
+    def _reset_completion(self) -> None:
+        self._complete_base = None
+        self._complete_matches = []
+        self._complete_idx = 0
+        self._complete_value = None
+
+    def _on_key(self, event: events.Key) -> None:
+        # Любое редактирование, кроме Tab/Shift+Tab, начинает дополнение заново.
+        if event.key not in ("tab", "shift+tab"):
+            self._reset_completion()
+
+    def _on_paste(self, event: events.Paste) -> None:
+        self._reset_completion()
 
     def action_history_prev(self) -> None:
         self.app.history_step(-1)
@@ -205,6 +248,85 @@ class QuestionInput(Input):
 
     def action_app_scroll_log_down(self) -> None:
         self.app.action_scroll_log_down()
+
+    def action_complete_next(self) -> None:
+        self._complete_command(1)
+
+    def action_complete_prev(self) -> None:
+        self._complete_command(-1)
+
+    def _complete_command(self, direction: int) -> None:
+        """Дополнение команд по Tab.
+
+        Работает только в командном контексте (строка начинается с «/»):
+        первый Tab дополняет до общего префикса совпадений, следующие —
+        перебирают варианты вперёд (Tab) и назад (Shift+Tab). Вне командного
+        контекста Tab ведёт себя как обычно — переводит фокус.
+        """
+        value = self.value
+        if not value.startswith("/"):
+            self._reset_completion()
+            if direction >= 0:
+                self.app.action_focus_next()
+            else:
+                self.app.action_focus_previous()
+            return
+
+        cursor = self.cursor_position
+        prefix = value[:cursor]
+        if not prefix.startswith("/"):
+            # Курсор стоит до «/» — дополнять нечего, Tab работает как обычно.
+            self._reset_completion()
+            if direction >= 0:
+                self.app.action_focus_next()
+            else:
+                self.app.action_focus_previous()
+            return
+        tail = value[cursor:]
+
+        if self._complete_base is not None and value == self._complete_value:
+            # Продолжаем начатый перебор вариантов.
+            matches = self._complete_matches
+            if not matches:
+                self._reset_completion()
+                return
+            index = (self._complete_idx + direction) % len(matches)
+        else:
+            matches = [cmd for cmd in COMMANDS if cmd.startswith(prefix)]
+            if not matches:
+                self._reset_completion()
+                self.app._set_status(
+                    f"Нет команд по «{prefix}». Доступно: {' '.join(COMMANDS)}."
+                )
+                return
+            common = os.path.commonprefix(matches)
+            if len(common) > len(prefix) and len(matches) > 1:
+                # Первый Tab дополняет до общего префикса, следующие — перебирают.
+                self._complete_base = prefix
+                self._complete_matches = matches
+                self._complete_idx = -1 if direction >= 0 else len(matches)
+                self._complete_value = common + tail
+                self.value = self._complete_value
+                self.cursor_position = len(common)
+                self.app._set_status(
+                    f"Дополнено: {common} · Tab — следующий вариант"
+                )
+                return
+            self._complete_base = prefix
+            self._complete_matches = matches
+            index = 0 if direction >= 0 else len(matches) - 1
+
+        command = matches[index % len(matches)]
+        self._complete_idx = index
+        self._complete_value = command + tail
+        self.value = self._complete_value
+        self.cursor_position = len(command)
+        if len(matches) > 1:
+            self.app._set_status(f"Дополнено: {command} · Tab — следующий вариант")
+        else:
+            description = COMMAND_DESCRIPTIONS.get(command, "")
+            suffix = f" — {description}" if description else ""
+            self.app._set_status(f"Дополнено: {command}{suffix}")
 
 
 class FillerPanel(Static):
@@ -223,7 +345,7 @@ class FillerPanel(Static):
                 elif value < 92:
                     row.append(glyphs[(x * 5 + y * 11) % len(glyphs)])
                 else:
-                    row.append("✠")
+                    row.append("▓")
             out.append("".join(row) + "\n", style=STYLE_IRON)
         return out
 
@@ -261,7 +383,6 @@ class EraModal(ModalScreen):
     def on_mount(self) -> None:
         dialog = self.query_one("#dialog")
         dialog.border_title = " НАЙДЕНЫ ДАННЫЕ ИЗ РАЗНЫХ ЭПОХ "
-        dialog.border_subtitle = " ✠ "
         self.query_one("#era-list", SelectionList).focus()
 
     @on(SelectionList.SelectedChanged)
@@ -292,7 +413,6 @@ class HelpModal(ModalScreen):
     def on_mount(self) -> None:
         dialog = self.query_one("#dialog")
         dialog.border_title = " СПРАВКА "
-        dialog.border_subtitle = " ✠ "
 
     @staticmethod
     def _help_text() -> Text:
@@ -304,6 +424,7 @@ class HelpModal(ModalScreen):
             ("Ctrl+U / Ctrl+D", "прокрутка журнала вверх/вниз"),
             ("PgUp / PgDn, колесо мыши", "прокрутка журнала"),
             ("↑ / ↓", "история вопросов в строке ввода"),
+            ("Tab / Shift+Tab", "автодополнение команд (например, /so → /sources)"),
             ("Ctrl+L", "очистить журнал"),
             ("F1", "эта справка"),
             ("Ctrl+C / Ctrl+Q", "выход"),
@@ -389,7 +510,6 @@ class SettingsModal(ModalScreen):
         app = self.app
         dialog = self.query_one("#dialog")
         dialog.border_title = " НАСТРОЙКИ ТЕРМИНАЛА "
-        dialog.border_subtitle = " ✠ "
         self.query_one("#sw-sounds", Switch).value = app._sounds
         self.query_one("#sw-typing", Switch).value = app._typing_delay > 0
         self.query_one("#sw-music", Switch).value = app._music_on
@@ -748,13 +868,6 @@ class MechanicusApp(App):
         color: $bone;
     }
 
-    #footer-emblem {
-        width: 2;
-        height: 1;
-        color: $dim-green;
-        content-align: center middle;
-    }
-
     #dialog {
         width: 66;
         height: auto;
@@ -1035,16 +1148,14 @@ class MechanicusApp(App):
             with Horizontal(id="input-row"):
                 yield Static(">", id="prompt")
                 yield QuestionInput(
-                    placeholder="Вопрос к архиву…  (/help — справка)",
+                    placeholder="Вопрос к архиву…  (/help — справка · Tab — автодополнение)",
                     id="question",
                 )
             with Horizontal(id="footer-row"):
                 yield Footer()
-                yield Static("✠", id="footer-emblem")
 
     def on_mount(self) -> None:
         self.query_one("#log-frame").border_title = " ЖУРНАЛ "
-        self.query_one("#log-frame").border_subtitle = " ✠ "
         self.query_one("#sources-col").border_title = " ИСТОЧНИКИ ПОСЛЕДНЕГО ОТВЕТА "
 
         self._panel_manual = bool(self._config["panel"])
@@ -1127,7 +1238,6 @@ class MechanicusApp(App):
         hint = "Вводите вопрос внизу. /help — справка, /sources — источники."
         if width >= 100:
             return [
-                ("        ✠", STYLE_IRON),
                 ("    ╱       ╲", STYLE_IRON),
                 ("  •═════════════•", STYLE_BLOOD),
                 ("  ARCHIVE TERMINAL", STYLE_BRASS),
@@ -1135,19 +1245,17 @@ class MechanicusApp(App):
                 ("", STYLE_DIM),
                 (self._greeting, STYLE_DIM),
                 (hint, STYLE_DIM),
-                ("        ✠", STYLE_IRON),
             ]
         if width >= 60:
             return [
-                ("  ✠ ARCHIVE TERMINAL ✠", STYLE_BRASS),
+                ("  ARCHIVE TERMINAL", STYLE_BRASS),
                 ("  ADEPTUS MECHANICUS", STYLE_BONE),
                 ("  •═════════════•", STYLE_BLOOD),
                 ("", STYLE_DIM),
                 (self._greeting, STYLE_DIM),
                 (hint, STYLE_DIM),
-                ("        ✠", STYLE_IRON),
             ]
-        return [("✠ ARCHIVE TERMINAL ✠", STYLE_BRASS)]
+        return [("ARCHIVE TERMINAL", STYLE_BRASS)]
 
     def _print_banner(self) -> None:
         pairs = self._banner_lines(self._term_width())
@@ -1178,7 +1286,7 @@ class MechanicusApp(App):
             self._fx_banner_timer = None
 
     def _start_header_reveal(self) -> None:
-        self._header_target = "✠ ARCHIVE TERMINAL · ADEPTUS MECHANICUS ✠"
+        self._header_target = "ARCHIVE TERMINAL · ADEPTUS MECHANICUS"
         self._header_pos = 0
         self._fx_header_timer = self.set_interval(HEADER_TICK, self._header_tick)
 
