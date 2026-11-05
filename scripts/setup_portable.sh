@@ -47,7 +47,7 @@ chmod +x "$TARGET/Warhammer Chat.sh"
 if [ -f "$PROJECT_ROOT/.env" ]; then
     cp "$PROJECT_ROOT/.env" "$TARGET/"
 else
-    echo "    .env не найден — создай его на флешке вручную (GROQ_API_KEY=...)"
+    echo "    .env не найден — создай его на флешке вручную (DEEPSEEK_API_KEY=...)"
 fi
 
 if [ -d "$TARGET/data/chroma_db" ]; then

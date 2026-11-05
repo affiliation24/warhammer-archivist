@@ -231,7 +231,7 @@ def _run(last_chunks):
         last_chunks = chunks
         _redraw(echo)
         play_sound("answer")
-        type_out(reply)
+        type_out(reply.replace("**", ""))  # в CLI жирный не рендерится — снимаем звёздочки
         print(dim("(наберите /sources, чтобы увидеть источники ответа)"))
 
 

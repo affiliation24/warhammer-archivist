@@ -1,17 +1,3 @@
-"""Textual-TUI в стиле arct (arc-academy-terminal) для Warhammer Archivist.
-
-Полноэкранный терминальный интерфейс вместо построчного CLI:
-- прокручиваемая история чата (колесо мыши, PgUp/PgDn, Ctrl+U/Ctrl+D);
-- строка ввода закреплена внизу, с историей вопросов (↑/↓);
-- нижняя панель с горячими клавишами (как бар в arct, всегда показывает актуальные);
-- боковая панель источников последнего ответа (Ctrl+F);
-- командная палитра (Ctrl+K / Ctrl+P), справка (F1), настройки (Ctrl+S);
-- темы (Ctrl+T) — все на базе исходной палитры (зелёный/латунь/кость/кровь/сталь),
-  меняется только фон/поверхности, сами цвета палитры не трогаются.
-
-Вся RAG-логика остаётся в generator.py/retriever.py без изменений: ответы считаются
-в фоновом потоке (workers), интерфейс в это время не блокируется.
-"""
 import asyncio
 import contextlib
 import json
@@ -27,8 +13,10 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.command import SimpleCommand
 from textual.containers import Center, Horizontal, Vertical, VerticalScroll
+from textual.geometry import Offset
 from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
+from textual.timer import Timer
 from textual.widgets import (
     Button,
     Footer,
@@ -56,19 +44,18 @@ from ui import (
     stop_background_music,
 )
 
-# ---------------------------------------------------------------------------
-# Палитра — перенесена из ui.py (ANSI 256): те же зелёный/латунь/кость/кровь/сталь.
-# ---------------------------------------------------------------------------
-BRASS = "#d7af5f"        # ANSI 178 — латунь/бронза
-BONE = "#ffd7af"         # ANSI 223 — кость/пергамент
-BLOOD = "#af5f5f"        # ANSI 131 — тусклый кровавый
-IRON = "#444444"         # ANSI 238 — тусклая сталь
-DULL_BRASS = "#af8700"   # ANSI 136 — тусклая латунь
-GREEN = "#00ff00"        # яркий зелёный (акценты)
-DARK_GREEN = "#008000"   # тёмный зелёный (основной текст ответов)
-DIM_GREEN = "#6f9f6f"    # приглушённый зелёный (подсказки)
+BRASS = "#d7af5f"
+BONE = "#ffd7af"
+BLOOD = "#af5f5f"
+IRON = "#444444"
+DULL_BRASS = "#af8700"
+GREEN = "#00ff00"
+DARK_GREEN = "#1e9e1e"
+DIM_GREEN = "#6f9f6f"
+PHOSPHOR_BRIGHT = "#8dff3a"
+ALERT = "#ff7a1a"
 
-STYLE_BRASS = Style(color=BRASS, bold=True)
+STYLE_BRASS = Style(color=BRASS)
 STYLE_BONE = Style(color=BONE)
 STYLE_BLOOD = Style(color=BLOOD)
 STYLE_IRON = Style(color=IRON)
@@ -77,7 +64,32 @@ STYLE_GREEN = Style(color=GREEN)
 STYLE_DARK_GREEN = Style(color=DARK_GREEN)
 STYLE_DIM = Style(color=DIM_GREEN)
 
-TYPEWRITER_DELAY = 0.012  # секунд на символ — как в старом CLI
+TYPEWRITER_DELAY = 0.012
+
+STAGE_MAX_WIDTH = 132
+PANEL_AUTO_WIDTH = 120
+SCRAMBLE_GLYPHS = "▓▒░█▚▞◇◈┼╳"
+SCRAMBLE_TICK = 0.045
+SCRAMBLE_STEP = 2
+FLICKER_MIN = 3.0
+FLICKER_MAX = 8.0
+FLICKER_HOLD_MIN = 0.06
+FLICKER_HOLD_MAX = 0.1
+SCANLINE_PERIOD = 5.0
+SCANLINE_TICK = 0.12
+STATUS_FLASH = 0.15
+PULSE_TICK = 0.45
+HEADER_TICK = 0.03
+BANNER_TICK = 0.12
+BOOT_TYPE_TICK = 0.03
+BOOT_TYPE_STEP = 2
+
+SESSION_LABELS = {
+    "s-epoch": "ЭПОХА:",
+    "s-count": "ФРАГМЕНТОВ:",
+    "s-relevance": "РЕЛЕВАНТНОСТЬ:",
+    "s-theme": "ТЕМА:",
+}
 
 THEME_NAMES = ("mechanicus", "mechanicus-dark", "mechanicus-void")
 THEME_DISPLAY_NAMES = {
@@ -95,20 +107,17 @@ CONFIG_DEFAULTS = {
     "typing": True,
     "music": True,
     "panel": False,
+    "crt": True,
 }
 
-EXPECTED_BOOT_SECONDS = [1.0, 4.0, 5.0, 90.0]  # грубая интерполяция прогресса, как в старом CLI
+EXPECTED_BOOT_SECONDS = [1.0, 4.0, 5.0, 90.0]
 
-# Файл с настоящим файловым дескриптором на время RAG-воркеров: Textual во
-# время работы подменяет sys.stderr заглушкой с fileno() == -1, из-за чего
-# multiprocessing.resource_tracker падает при спавне своего процесса
-# (ValueError: bad value(s) in fds_to_keep) — см. _ask_worker.
 _DEVNULL_STDERR = open(os.devnull, "w", encoding="utf-8")
 
 
-def _make_theme(name: str, bg: str, surface: str, panel: str, fg: str) -> Theme:
-    """Тема на базе исходной палитры: цвета акцентов одни и те же, меняется
-    только фон/поверхности. Пользовательскую палитру таким образом не трогаем."""
+def _make_theme(
+    name: str, bg: str, surface: str, panel: str, fg: str, frame: str, scanline: str
+) -> Theme:
     return Theme(
         name=name,
         primary=BRASS,
@@ -136,27 +145,23 @@ def _make_theme(name: str, bg: str, surface: str, panel: str, fg: str) -> Theme:
             "green": GREEN,
             "dark-green": DARK_GREEN,
             "dim-green": DIM_GREEN,
+            "phosphor-bright": PHOSPHOR_BRIGHT,
+            "alert": ALERT,
+            "frame": frame,
+            "scanline": scanline,
         },
     )
 
 
 def _all_themes() -> list[Theme]:
     return [
-        _make_theme("mechanicus", "#0a0c0a", "#0f130f", "#161d16", BONE),
-        _make_theme("mechanicus-dark", "#070907", "#0c0f0c", "#121812", "#e8c9a5"),
-        _make_theme("mechanicus-void", "#050705", "#0a0d0a", "#0f140f", "#d9bfa0"),
+        _make_theme("mechanicus", "#0a0c0a", "#0f130f", "#161d16", BONE, "#445544", "#1a2b12"),
+        _make_theme("mechanicus-dark", "#030403", "#080a08", "#0e120e", "#e8c9a5", "#5f8c3a", "#243d18"),
+        _make_theme("mechanicus-void", "#101308", "#161c0f", "#1d2512", "#d9bfa0", "#3a4434", "#0f1a0a"),
     ]
 
 
 def _build_input_bindings() -> list[Binding]:
-    """Биндинги QuestionInput: стандартные клавиши Input, плюс переопределение
-    Ctrl+K/Ctrl+U/Ctrl+D в пользу TUI-приложения (палитра, прокрутка журнала),
-    плюс история вопросов по ↑/↓.
-
-    Textual объединяет BINDINGS по всей иерархии классов, поэтому убрать
-    стандартный ctrl+k фильтрацией нельзя — ставим свой биндинг с priority=True,
-    он проверяется раньше родительского (как в arct, где эти клавиши глобальные).
-    """
     removed = {"ctrl+k", "ctrl+u", "ctrl+d"}
     keep: list[Binding] = []
     for b in Input.BINDINGS:
@@ -175,33 +180,16 @@ def _build_input_bindings() -> list[Binding]:
                 tooltip=b.tooltip,
             )
         )
-    keep.append(
-        Binding("ctrl+k", "app_command_palette", "Палитра", show=False, priority=True)
-    )
-    keep.append(
-        Binding("ctrl+u", "app_scroll_log_up", "Вверх", show=False, priority=True)
-    )
-    keep.append(
-        Binding("ctrl+d", "app_scroll_log_down", "Вниз", show=False, priority=True)
-    )
+    keep.append(Binding("ctrl+k", "app_command_palette", "Палитра", show=False, priority=True))
+    keep.append(Binding("ctrl+u", "app_scroll_log_up", "Вверх", show=False, priority=True))
+    keep.append(Binding("ctrl+d", "app_scroll_log_down", "Вниз", show=False, priority=True))
     keep.append(Binding("up", "history_prev", "Предыдущий вопрос", show=False))
     keep.append(Binding("down", "history_next", "Следующий вопрос", show=False))
     return keep
 
 
 class QuestionInput(Input):
-    """Input с историей вопросов (↑/↓) и освобождёнными для TUI клавишами.
-
-    Ctrl+K (палитра), Ctrl+U/Ctrl+D (прокрутка журнала) в стандартном Input
-    заняты редактированием строки — здесь они отдаются приложению, как в arct.
-    """
-
-    # ВАЖНО: присваивать в теле класса, а не после — Textual фиксирует
-    # BINDINGS в момент создания класса.
     BINDINGS = _build_input_bindings()
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
 
     def action_history_prev(self) -> None:
         self.app.history_step(-1)
@@ -219,9 +207,28 @@ class QuestionInput(Input):
         self.app.action_scroll_log_down()
 
 
-class EraModal(ModalScreen):
-    """Уточнение эпохи, когда retrieval нашёл данные из разных эпох (стрелки + Enter)."""
+class FillerPanel(Static):
+    def render(self) -> Text:
+        width, height = self.size
+        if width < 2 or height < 1:
+            return Text("")
+        glyphs = " ░▒▓▚▞"
+        out = Text()
+        for y in range(height):
+            row = []
+            for x in range(width):
+                value = (x * 7 + y * 13) % 97
+                if value < 44:
+                    row.append(" ")
+                elif value < 92:
+                    row.append(glyphs[(x * 5 + y * 11) % len(glyphs)])
+                else:
+                    row.append("✠")
+            out.append("".join(row) + "\n", style=STYLE_IRON)
+        return out
 
+
+class EraModal(ModalScreen):
     BINDINGS = [Binding("escape", "cancel", "Отмена")]
 
     def __init__(self, by_era: dict[str, list[dict]]):
@@ -234,7 +241,6 @@ class EraModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Center():
             with Vertical(id="dialog"):
-                yield Static("НАЙДЕНЫ ДАННЫЕ ИЗ РАЗНЫХ ЭПОХ", classes="dialog-title")
                 yield Static(
                     Text(
                         "Реливантные записи относятся к разным эпохам вселенной.\n"
@@ -253,6 +259,9 @@ class EraModal(ModalScreen):
                 )
 
     def on_mount(self) -> None:
+        dialog = self.query_one("#dialog")
+        dialog.border_title = " НАЙДЕНЫ ДАННЫЕ ИЗ РАЗНЫХ ЭПОХ "
+        dialog.border_subtitle = " ✠ "
         self.query_one("#era-list", SelectionList).focus()
 
     @on(SelectionList.SelectedChanged)
@@ -263,8 +272,6 @@ class EraModal(ModalScreen):
 
 
 class HelpModal(ModalScreen):
-    """Справка по горячим клавишам (как ?/F1 в arct)."""
-
     BINDINGS = [
         Binding("escape", "close", "Закрыть"),
         Binding("enter", "close", "Закрыть", show=False),
@@ -276,12 +283,16 @@ class HelpModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Center():
             with Vertical(id="dialog"):
-                yield Static("СПРАВКА", classes="dialog-title")
                 yield Static(self._help_text(), markup=False)
                 yield Static(
                     Text("Esc / Enter — закрыть", style=STYLE_DIM),
                     markup=False,
                 )
+
+    def on_mount(self) -> None:
+        dialog = self.query_one("#dialog")
+        dialog.border_title = " СПРАВКА "
+        dialog.border_subtitle = " ✠ "
 
     @staticmethod
     def _help_text() -> Text:
@@ -301,15 +312,41 @@ class HelpModal(ModalScreen):
         ]
         out = Text()
         for key, desc in rows:
+            lines = HelpModal._wrap_desc(key, desc) or [""]
+            key_disp = f"{key:<24}" if len(key) <= 24 else f"{key} "
             out.append("  ", style=STYLE_IRON)
-            out.append(f"{key:<24}", style=STYLE_BRASS)
-            out.append(f"{desc}\n", style=STYLE_BONE)
+            out.append(key_disp, style=STYLE_BRASS)
+            out.append(f"{lines[0]}\n", style=STYLE_BONE)
+            indent = " " * (2 + len(key_disp))
+            for extra in lines[1:]:
+                out.append(indent + extra + "\n", style=STYLE_BONE)
         return out
+
+    @staticmethod
+    def _wrap_desc(key: str, desc: str) -> list[str]:
+        key_disp = f"{key:<24}" if len(key) <= 24 else f"{key} "
+        capacity = max(10, 60 - 2 - len(key_disp))
+        words = desc.split(" ")
+        wrapped: list[str] = []
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if len(candidate) <= capacity:
+                current = candidate
+                continue
+            if current:
+                wrapped.append(current)
+                current = ""
+            while len(word) > capacity:
+                wrapped.append(word[:capacity])
+                word = word[capacity:]
+            current = word
+        if current:
+            wrapped.append(current)
+        return wrapped
 
 
 class SettingsModal(ModalScreen):
-    """Настройки интерфейса: звук, печатная машинка, музыка, панель, тема."""
-
     BINDINGS = [Binding("escape", "close", "Закрыть")]
 
     def action_close(self) -> None:
@@ -318,7 +355,6 @@ class SettingsModal(ModalScreen):
     def compose(self) -> ComposeResult:
         with Center():
             with Vertical(id="dialog"):
-                yield Static("НАСТРОЙКИ ТЕРМИНАЛА", classes="dialog-title")
                 with Horizontal(classes="setting-row"):
                     yield Static("Звуковые сигналы", classes="setting-label")
                     yield Switch(value=False, id="sw-sounds")
@@ -331,6 +367,9 @@ class SettingsModal(ModalScreen):
                 with Horizontal(classes="setting-row"):
                     yield Static("Панель источников", classes="setting-label")
                     yield Switch(value=False, id="sw-panel")
+                with Horizontal(classes="setting-row"):
+                    yield Static("Эффекты CRT", classes="setting-label")
+                    yield Switch(value=False, id="sw-crt")
                 yield Static(
                     Text("Тема (палитра не меняется — только фон):", style=STYLE_BONE),
                     classes="setting-label",
@@ -343,33 +382,58 @@ class SettingsModal(ModalScreen):
                     ],
                     id="theme-list",
                 )
-                yield Button("Готово", id="done-btn", variant="primary")
+                with Horizontal(id="done-row"):
+                    yield Button("Готово", id="done-btn", variant="primary")
 
     def on_mount(self) -> None:
         app = self.app
+        dialog = self.query_one("#dialog")
+        dialog.border_title = " НАСТРОЙКИ ТЕРМИНАЛА "
+        dialog.border_subtitle = " ✠ "
         self.query_one("#sw-sounds", Switch).value = app._sounds
         self.query_one("#sw-typing", Switch).value = app._typing_delay > 0
         self.query_one("#sw-music", Switch).value = app._music_on
         self.query_one("#sw-panel", Switch).value = app._panel_on
+        self.query_one("#sw-crt", Switch).value = app._crt_on
         self.query_one("#theme-list", SelectionList).select(app.theme)
 
     @on(Switch.Changed)
     def _on_switch(self, event: Switch.Changed) -> None:
         app = self.app
         switch_id = event.switch.id
+        value = event.value
+
         if switch_id == "sw-sounds":
-            app._sounds = event.value
+            if app._sounds == value:
+                return
+            app._sounds = value
         elif switch_id == "sw-typing":
-            app._typing_delay = TYPEWRITER_DELAY if event.value else 0.0
+            new_delay = TYPEWRITER_DELAY if value else 0.0
+            if app._typing_delay == new_delay:
+                return
+            app._typing_delay = new_delay
         elif switch_id == "sw-music":
-            app._music_on = event.value
-            if event.value:
+            if app._music_on == value:
+                return
+            app._music_on = value
+            if value:
                 start_background_music()
             else:
                 stop_background_music()
         elif switch_id == "sw-panel":
-            app._panel_on = event.value
-            app._apply_panel_visibility()
+            if app._panel_on == value:
+                return
+            app._set_panel(value)
+        elif switch_id == "sw-crt":
+            if app._crt_on == value:
+                return
+            app._crt_on = value
+            if value:
+                app._start_crt_effects()
+            else:
+                app._stop_crt_effects()
+        else:
+            return
         app._save_config()
 
     @on(SelectionList.SelectedChanged)
@@ -384,8 +448,6 @@ class SettingsModal(ModalScreen):
 
 
 class BootScreen(Screen):
-    """Экран прогрева моделей при первом (холодном) запуске."""
-
     def compose(self) -> ComposeResult:
         with Center():
             with Vertical(id="boot-box"):
@@ -398,7 +460,20 @@ class BootScreen(Screen):
                 yield Static(markup=False, id="boot-bar")
 
     def on_mount(self) -> None:
+        self._typed = 0
+        self._stage_idx = -1
         self.set_interval(0.15, self._refresh)
+        self.set_interval(BOOT_TYPE_TICK, self._type_tick)
+        self._refresh()
+
+    def _type_tick(self) -> None:
+        app = self.app
+        idx = app._boot_idx
+        if idx != self._stage_idx:
+            self._stage_idx = idx
+            self._typed = 0
+        label = BOOT_STAGES[idx][1]
+        self._typed = min(self._typed + BOOT_TYPE_STEP, len(label))
         self._refresh()
 
     def _refresh(self) -> None:
@@ -417,7 +492,7 @@ class BootScreen(Screen):
             if i < idx:
                 out.append(f"  ✓ {label}\n", style=STYLE_BRASS)
             elif i == idx:
-                out.append(f"  ⠿ {label}...\n", style=STYLE_BONE)
+                out.append(f"  ▌ {label[: self._typed]}\n", style=STYLE_BONE)
             else:
                 out.append(f"    {label}\n", style=STYLE_DIM)
         out.append("\n")
@@ -433,8 +508,6 @@ class BootScreen(Screen):
 
 
 class MechanicusApp(App):
-    """Главное приложение: макет в духе arct поверх существующей RAG-логики."""
-
     TITLE = "Warhammer Archivist"
     SUB_TITLE = "Терминал Адептус Механикус"
 
@@ -448,20 +521,53 @@ class MechanicusApp(App):
         background: $bg;
     }
 
-    /* ВАЖНО: у виджетов с рамкой height считается ВМЕСТЕ с рамкой (border
-       занимает строку внутри виджета) — поэтому height: 2 = строка контента
-       + строка рамки снизу. */
     #header {
-        height: 2;
-        background: $panel;
-        color: $brass;
+        height: 3;
+        background: $bg;
+        border-bottom: solid $frame;
+    }
+
+    #header-line {
+        width: 100%;
+        height: 1;
+        text-align: center;
+        color: $phosphor-bright;
         text-style: bold;
-        padding: 0 1;
-        border-bottom: solid $blood;
+    }
+
+    #session-tag {
+        width: 100%;
+        height: 1;
+        text-align: center;
+        color: $dim-green;
+    }
+
+    #main-row {
+        height: 1fr;
     }
 
     #main {
         height: 1fr;
+    }
+
+    .gutter {
+        width: 1fr;
+        height: 1fr;
+        background: $bg;
+        color: $iron;
+        text-opacity: 0.35;
+    }
+
+    #log-frame {
+        width: 1fr;
+        height: 1fr;
+        border: double $frame;
+        border-title-color: $phosphor-bright;
+        border-title-background: $bg;
+        border-title-style: bold;
+        border-subtitle-color: $dim-green;
+        border-subtitle-align: center;
+        padding: 0 1;
     }
 
     #chat-scroll {
@@ -471,13 +577,42 @@ class MechanicusApp(App):
         padding: 0 1;
         scrollbar-size-vertical: 1;
         scrollbar-background: $panel;
-        scrollbar-color: $iron;
-        scrollbar-color-hover: $brass;
-        scrollbar-color-active: $brass;
+        scrollbar-color: $frame;
+        scrollbar-color-hover: $phosphor-bright;
+        scrollbar-color-active: $phosphor-bright;
     }
 
-    #chat-scroll > .scrollbar {
-        background: $panel;
+    #scanline {
+        layer: overlay;
+        width: 100%;
+        height: 1;
+        background: $scanline;
+        offset: 0 0;
+        display: none;
+    }
+
+    #scanline.-on {
+        display: block;
+    }
+
+    .hl-band {
+        width: 100%;
+        height: auto;
+        background: $phosphor-bright;
+        color: $bg;
+        text-style: bold;
+        padding: 0 1;
+        margin-top: 1;
+        margin-bottom: 1;
+    }
+
+    .hl-band.-flicker {
+        background: $dim-green;
+    }
+
+    .banner {
+        text-align: center;
+        width: 100%;
     }
 
     #sources-col {
@@ -485,7 +620,10 @@ class MechanicusApp(App):
         height: 1fr;
         display: none;
         background: $surface;
-        border-left: solid $iron;
+        border: double $frame;
+        border-title-color: $phosphor-bright;
+        border-title-background: $bg;
+        border-title-style: bold;
         padding: 0 1;
     }
 
@@ -493,34 +631,59 @@ class MechanicusApp(App):
         display: block;
     }
 
-    #sources-title {
-        height: 1;
-        background: $panel;
-        color: $brass;
-        text-style: bold;
-        padding: 0 1;
-        text-align: center;
-    }
-
     #sources-list {
         background: $surface;
         height: 1fr;
     }
 
+    #session-data {
+        height: 5;
+        background: $surface;
+        border-top: solid $frame;
+    }
+
+    #session-data Static {
+        width: 100%;
+        height: 1;
+        content-align: right middle;
+    }
+
     #status-row {
         height: 1;
-        background: $panel;
+        background: $alert;
     }
 
     #status {
         width: 1fr;
-        color: $dim-green;
+        height: 1;
+        color: #3a2200;
         padding: 0 1;
+        opacity: 0.65;
+    }
+
+    #status-row.-busy #status {
+        opacity: 1;
+        color: #0d0800;
+        text-style: bold;
+    }
+
+    #status-row.-pulse-alt {
+        background: #d6660f;
+    }
+
+    #status-row.-flash {
+        background: $phosphor-bright;
+    }
+
+    #status-row.-flash #status {
+        opacity: 1;
+        color: #061200;
     }
 
     #spinner {
         width: 2;
-        color: $brass;
+        height: 1;
+        color: #0d0800;
         display: none;
     }
 
@@ -531,13 +694,13 @@ class MechanicusApp(App):
     #input-row {
         height: 4;
         background: $surface;
-        border-top: solid $iron;
+        border-top: double $frame;
         padding: 0 1;
     }
 
     #prompt {
         width: 2;
-        color: $dim-green;
+        color: $phosphor-bright;
         content-align: center middle;
         text-style: bold;
     }
@@ -557,11 +720,18 @@ class MechanicusApp(App):
         color: $dim-green;
     }
 
-    Footer {
+    #footer-row {
         height: 2;
         background: $panel;
+        border-top: solid $frame;
+    }
+
+    #footer-row Footer {
+        width: 1fr;
+        height: 1;
+        dock: none;
+        background: $panel;
         color: $dull-brass;
-        border-top: solid $iron;
     }
 
     FooterKey {
@@ -570,7 +740,7 @@ class MechanicusApp(App):
     }
 
     FooterKey.-command-palette {
-        background: $blood;
+        background: $alert;
         color: $bg;
     }
 
@@ -578,27 +748,37 @@ class MechanicusApp(App):
         color: $bone;
     }
 
+    #footer-emblem {
+        width: 2;
+        height: 1;
+        color: $dim-green;
+        content-align: center middle;
+    }
+
     #dialog {
         width: 66;
         height: auto;
         background: $surface;
-        border: thick $iron;
+        border: heavy $frame;
         padding: 1 2;
+        border-title-color: $phosphor-bright;
+        border-title-background: $bg;
+        border-title-style: bold;
+        border-subtitle-color: $dim-green;
+        border-subtitle-align: center;
     }
 
     #boot-box {
         width: 62;
         height: auto;
         background: $bg;
-        border: thick $iron;
+        border: heavy $frame;
         padding: 1 2;
     }
 
-    .dialog-title {
-        color: $brass;
+    #boot-title {
+        color: $phosphor-bright;
         text-style: bold;
-        background: $panel;
-        padding: 0 1;
     }
 
     .setting-row {
@@ -613,13 +793,8 @@ class MechanicusApp(App):
 
     #era-list, #theme-list {
         background: $surface;
-        border: solid $iron;
+        border: solid $frame;
         padding: 0 1;
-        height: auto;
-    }
-
-    #era-hint, #era-cancel-hint {
-        color: $dim-green;
         height: auto;
     }
 
@@ -629,13 +804,32 @@ class MechanicusApp(App):
     }
 
     SelectionList > .selection-list--button-highlighted {
-        color: $brass;
-        background: $iron;
+        color: $bg;
+        background: $phosphor-bright;
         text-style: bold;
     }
 
     SelectionList > .selection-list--button-selected {
-        color: $green;
+        color: $phosphor-bright;
+        text-style: bold;
+    }
+
+    Switch {
+        border: tall $frame;
+        background: $surface;
+    }
+
+    Switch .switch--slider {
+        color: $iron;
+        background: $bg;
+    }
+
+    Switch.-on .switch--slider {
+        color: $phosphor-bright;
+    }
+
+    Switch:focus {
+        border: tall $phosphor-bright;
     }
 
     Button {
@@ -643,13 +837,80 @@ class MechanicusApp(App):
         margin-top: 1;
     }
 
+    Button.-primary {
+        background: $phosphor-bright;
+        color: $bg;
+    }
+
+    #done-row {
+        width: 100%;
+        height: 3;
+    }
+
     #done-btn {
         dock: right;
     }
 
-    .banner {
-        text-align: center;
-        width: 100%;
+    CommandPalette {
+        background: $bg 60%;
+    }
+
+    CommandPalette #--container {
+        width: 66;
+        height: auto;
+        border: heavy $frame;
+        background: $surface;
+        padding: 1 2;
+    }
+
+    CommandPalette #--input {
+        border: hkey $frame;
+        background: $panel;
+    }
+
+    CommandPalette #--input Label {
+        color: $phosphor-bright;
+        margin-top: 1;
+        margin-left: 1;
+    }
+
+    CommandPalette #--input Button {
+        min-width: 7;
+        margin-right: 1;
+    }
+
+    CommandPalette #--results {
+        overlay: none;
+        height: auto;
+    }
+
+    SearchIcon {
+        display: none;
+    }
+
+    CommandPalette Input {
+        color: $phosphor-bright;
+        background: $panel;
+    }
+
+    CommandPalette Input:focus {
+        border: none;
+        background: $panel;
+    }
+
+    CommandList {
+        background: $surface;
+    }
+
+    CommandList > .option-list--option {
+        color: $bone;
+        background: $surface;
+    }
+
+    CommandList > .option-list--option-highlighted {
+        color: $bg;
+        background: $phosphor-bright;
+        text-style: bold;
     }
     """
 
@@ -683,6 +944,7 @@ class MechanicusApp(App):
         self._typing_delay: float = TYPEWRITER_DELAY if self._config["typing"] else 0.0
         self._music_on: bool = bool(self._config["music"])
         self._panel_on: bool = bool(self._config["panel"])
+        self._crt_on: bool = bool(self._config["crt"])
 
         self._busy = False
         self._typing_active = False
@@ -694,15 +956,31 @@ class MechanicusApp(App):
         self._pending_question = ""
         self._pending_by_era: dict[str, list[dict]] = {}
 
+        self._panel_manual: bool = False
+        self._status_text: str = ""
+        self._headline_widget: Static | None = None
+        self._typing_widget: Static | None = None
+        self._scan_y: float = 0.0
+        self._session_targets: dict[str, str] = {}
+        self._scramble_states: dict[str, dict] = {}
+        self._header_target: str = ""
+        self._header_pos: int = 0
+        self._banner_pairs: list[tuple[str, Style]] = []
+        self._banner_idx: int = 0
+
+        self._fx_scan_timer: Timer | None = None
+        self._fx_flicker_timer: Timer | None = None
+        self._fx_pulse_timer: Timer | None = None
+        self._fx_scramble_timer: Timer | None = None
+        self._fx_flash_timer: Timer | None = None
+        self._fx_header_timer: Timer | None = None
+        self._fx_banner_timer: Timer | None = None
+
         self._boot_screen: BootScreen | None = None
         self._boot_idx = 0
         self._boot_stage_started = time.monotonic()
-        # Textual 8 может доставлять Worker.StateChanged (SUCCESS/ERROR) для
-        # одного воркера несколько раз — запоминаем обработанные события,
-        # чтобы ответ не печатался дважды, а boot не завершался дважды.
         self._handled_worker_events: set[tuple[int, str]] = set()
 
-    # ------------------------------------------------------------------ данные
     def _load_config(self) -> dict:
         cfg = dict(CONFIG_DEFAULTS)
         try:
@@ -722,6 +1000,7 @@ class MechanicusApp(App):
             typing=self._typing_delay > 0,
             music=self._music_on,
             panel=self._panel_on,
+            crt=self._crt_on,
         )
         try:
             CONFIG_PATH.write_text(
@@ -729,17 +1008,27 @@ class MechanicusApp(App):
                 encoding="utf-8",
             )
         except OSError:
-            pass  # проект может лежать на read-only носителе — настройки тогда просто не сохранятся
+            pass
 
-    # ------------------------------------------------------------------- layout
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Static(markup=False, id="header")
-            with Horizontal(id="main"):
-                yield VerticalScroll(id="chat-scroll")
-                with Vertical(id="sources-col"):
-                    yield Static("ИСТОЧНИКИ ПОСЛЕДНЕГО ОТВЕТА", id="sources-title")
-                    yield VerticalScroll(id="sources-list")
+            with Vertical(id="header"):
+                yield Static("", id="header-line")
+                yield Static("", id="session-tag")
+            with Horizontal(id="main-row"):
+                yield FillerPanel(id="gutter-left", classes="gutter")
+                with Horizontal(id="main"):
+                    with Vertical(id="log-frame"):
+                        yield VerticalScroll(id="chat-scroll")
+                        yield Static("", id="scanline")
+                    with Vertical(id="sources-col"):
+                        yield VerticalScroll(id="sources-list")
+                        with Vertical(id="session-data"):
+                            yield Static(markup=False, id="s-epoch")
+                            yield Static(markup=False, id="s-count")
+                            yield Static(markup=False, id="s-relevance")
+                            yield Static(markup=False, id="s-theme")
+                yield FillerPanel(id="gutter-right", classes="gutter")
             with Horizontal(id="status-row"):
                 yield Static(markup=False, id="status")
                 yield LoadingIndicator(id="spinner")
@@ -749,22 +1038,25 @@ class MechanicusApp(App):
                     placeholder="Вопрос к архиву…  (/help — справка)",
                     id="question",
                 )
-            yield Footer()
+            with Horizontal(id="footer-row"):
+                yield Footer()
+                yield Static("✠", id="footer-emblem")
 
     def on_mount(self) -> None:
-        self.query_one("#header").update(
-            Text.assemble(
-                ("✠ ARCHIVE TERMINAL", STYLE_BRASS),
-                ("  ·  ", STYLE_IRON),
-                ("ADEPTUS MECHANICUS", STYLE_BONE),
-                ("  |  ", STYLE_IRON),
-                (self._greeting, STYLE_DIM),
-            )
-        )
-        self._set_status("Готов к приёму запроса.")
-        self._print_banner()
+        self.query_one("#log-frame").border_title = " ЖУРНАЛ "
+        self.query_one("#log-frame").border_subtitle = " ✠ "
+        self.query_one("#sources-col").border_title = " ИСТОЧНИКИ ПОСЛЕДНЕГО ОТВЕТА "
+
+        self._panel_manual = bool(self._config["panel"])
+        self._apply_stage_width()
+        if not self._panel_manual:
+            self._panel_on = self._stage_width() >= PANEL_AUTO_WIDTH
         self._apply_panel_visibility()
         self._refresh_sources_placeholder()
+        self._init_session_data()
+
+        self._set_status("Готов к приёму запроса.")
+        self._start_header_reveal()
 
         if self._sounds:
             play_sound("startup")
@@ -776,13 +1068,49 @@ class MechanicusApp(App):
         else:
             self.query_one("#question", QuestionInput).focus()
 
+        if self._crt_on:
+            self._start_crt_effects()
+
     def on_unmount(self) -> None:
+        self._stop_timer(self._fx_header_timer)
+        self._stop_timer(self._fx_banner_timer)
+        self._fx_header_timer = None
+        self._fx_banner_timer = None
+        self._stop_crt_effects()
+        if not self._panel_manual:
+            self._panel_on = bool(self._config["panel"])
         self._save_config()
         stop_background_music()
         if self._sounds:
             play_sound("exit")
 
-    # ------------------------------------------------------------- сообщения
+    def on_resize(self, event: events.Resize) -> None:
+        width = event.size.width if event.size is not None else self._term_width()
+        self._apply_stage_width(width)
+        self._auto_panel(min(STAGE_MAX_WIDTH, width))
+
+    @staticmethod
+    def _stop_timer(timer: Timer | None) -> None:
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
+    def _term_width(self) -> int:
+        size = self.size
+        if size is not None and size.width > 0:
+            return size.width
+        return 80
+
+    def _stage_width(self) -> int:
+        return min(STAGE_MAX_WIDTH, self._term_width())
+
+    def _apply_stage_width(self, width: int | None = None) -> None:
+        if width is None:
+            width = self._term_width()
+        self.query_one("#main").styles.width = min(STAGE_MAX_WIDTH, max(40, width))
+
     def _chat(self) -> VerticalScroll:
         return self.query_one("#chat-scroll", VerticalScroll)
 
@@ -795,42 +1123,149 @@ class MechanicusApp(App):
             chat.scroll_end(force=True)
         return widget
 
+    def _banner_lines(self, width: int) -> list[tuple[str, Style]]:
+        hint = "Вводите вопрос внизу. /help — справка, /sources — источники."
+        if width >= 100:
+            return [
+                ("        ✠", STYLE_IRON),
+                ("    ╱       ╲", STYLE_IRON),
+                ("  •═════════════•", STYLE_BLOOD),
+                ("  ARCHIVE TERMINAL", STYLE_BRASS),
+                ("  ADEPTUS MECHANICUS", STYLE_BONE),
+                ("", STYLE_DIM),
+                (self._greeting, STYLE_DIM),
+                (hint, STYLE_DIM),
+                ("        ✠", STYLE_IRON),
+            ]
+        if width >= 60:
+            return [
+                ("  ✠ ARCHIVE TERMINAL ✠", STYLE_BRASS),
+                ("  ADEPTUS MECHANICUS", STYLE_BONE),
+                ("  •═════════════•", STYLE_BLOOD),
+                ("", STYLE_DIM),
+                (self._greeting, STYLE_DIM),
+                (hint, STYLE_DIM),
+                ("        ✠", STYLE_IRON),
+            ]
+        return [("✠ ARCHIVE TERMINAL ✠", STYLE_BRASS)]
+
     def _print_banner(self) -> None:
-        lines = [
-            ("        ✠", STYLE_IRON),
-            ("    ╱       ╲", STYLE_IRON),
-            ("  •═════════════•", STYLE_BLOOD),
-            ("  ARCHIVE TERMINAL", STYLE_BRASS),
-            ("  ADEPTUS MECHANICUS", STYLE_BONE),
-            ("", STYLE_DIM),
-            (self._greeting, STYLE_DIM),
-            ("Вводите вопрос внизу. /help — справка, /sources — источники.", STYLE_DIM),
-            ("", STYLE_DIM),
-        ]
-        banner = Text()
-        for text, style in lines:
-            banner.append(text + "\n", style=style)
-        self._append_msg(banner, classes="banner")
+        pairs = self._banner_lines(self._term_width())
+        chat = self._chat()
+        at_end = chat.is_vertical_scroll_end
+        self._banner_pairs = pairs
+        self._banner_idx = 0
+        for text, _style in pairs:
+            chat.mount(Static(Text(text, style=STYLE_DIM), markup=False, classes="banner"))
+        if at_end:
+            chat.scroll_end(force=True)
+        self._fx_banner_timer = self.set_interval(BANNER_TICK, self._banner_tick)
+
+    def _banner_tick(self) -> None:
+        try:
+            pairs = self._banner_pairs
+            if self._banner_idx >= len(pairs):
+                self._stop_timer(self._fx_banner_timer)
+                self._fx_banner_timer = None
+                return
+            text, style = pairs[self._banner_idx]
+            widgets = self._chat().query(".banner")
+            if self._banner_idx < len(widgets):
+                widgets[self._banner_idx].update(Text(text, style=style))
+            self._banner_idx += 1
+        except Exception:
+            self._stop_timer(self._fx_banner_timer)
+            self._fx_banner_timer = None
+
+    def _start_header_reveal(self) -> None:
+        self._header_target = "✠ ARCHIVE TERMINAL · ADEPTUS MECHANICUS ✠"
+        self._header_pos = 0
+        self._fx_header_timer = self.set_interval(HEADER_TICK, self._header_tick)
+
+    def _header_tick(self) -> None:
+        try:
+            self._header_pos += 1
+            line = self.query_one("#header-line")
+            line.update(self._header_target[: self._header_pos])
+            if self._header_pos >= len(self._header_target):
+                self._stop_timer(self._fx_header_timer)
+                self._fx_header_timer = None
+                self.query_one("#session-tag").update(
+                    f"┌ ПАРАМЕТРЫ СЕАНСА · {self._greeting} ┐"
+                )
+                self._print_banner()
+        except Exception:
+            self._stop_timer(self._fx_header_timer)
+            self._fx_header_timer = None
 
     def _set_status(self, text: str) -> None:
-        self.query_one("#status").update(Text(text, style=STYLE_DIM))
+        self.query_one("#status").update(Text(text))
+        if text != self._status_text:
+            self._flash_status()
+        self._status_text = text
+
+    def _flash_status(self) -> None:
+        row = self.query_one("#status-row")
+        row.add_class("-flash")
+        self._stop_timer(self._fx_flash_timer)
+        self._fx_flash_timer = self.set_timer(STATUS_FLASH, self._end_flash)
+
+    def _end_flash(self) -> None:
+        self._fx_flash_timer = None
+        try:
+            row = self.query_one("#status-row")
+        except Exception:
+            return
+        row.remove_class("-flash")
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = busy
         self.query_one("#question", QuestionInput).disabled = busy
         spinner = self.query_one("#spinner")
+        row = self.query_one("#status-row")
         if busy:
             spinner.add_class("busy")
+            row.add_class("-busy")
         else:
             spinner.remove_class("busy")
+            row.remove_class("-busy")
+            row.remove_class("-pulse-alt")
+        if self._crt_on:
+            if busy and self._fx_pulse_timer is None:
+                self._fx_pulse_timer = self.set_interval(PULSE_TICK, self._pulse_tick)
+            elif not busy:
+                self._stop_timer(self._fx_pulse_timer)
+                self._fx_pulse_timer = None
 
-    # -------------------------------------------------------------- панель
+    def _pulse_tick(self) -> None:
+        try:
+            row = self.query_one("#status-row")
+            row.toggle_class("-pulse-alt")
+        except Exception:
+            pass
+
     def _apply_panel_visibility(self) -> None:
         col = self.query_one("#sources-col")
         if self._panel_on:
             col.add_class("visible")
         else:
             col.remove_class("visible")
+
+    def _auto_panel(self, width: int | None = None) -> None:
+        if self._panel_manual:
+            return
+        if width is None:
+            width = self._stage_width()
+        show = width >= PANEL_AUTO_WIDTH
+        if show != self._panel_on:
+            self._panel_on = show
+            self._apply_panel_visibility()
+
+    def _set_panel(self, on: bool) -> None:
+        self._panel_on = on
+        self._panel_manual = True
+        self._apply_panel_visibility()
+        self._save_config()
 
     def _refresh_sources_placeholder(self) -> None:
         box = self.query_one("#sources-list", VerticalScroll)
@@ -870,10 +1305,107 @@ class MechanicusApp(App):
             box.mount(Static(row, markup=False))
             box.mount(Static("", markup=False))
 
+    def _session_row(self, label: str, value: str) -> Text:
+        return Text.assemble(
+            (f"{label}  ", STYLE_DIM),
+            (value, STYLE_BONE),
+        )
+
+    def _init_session_data(self) -> None:
+        self._apply_session_values(
+            {
+                "s-epoch": "—",
+                "s-count": "0",
+                "s-relevance": "—",
+                "s-theme": THEME_DISPLAY_NAMES.get(self.theme, self.theme),
+            }
+        )
+
+    def _update_session_data(self, chunks: list[dict]) -> None:
+        scores = [float(c.get("score", 0.0)) for c in chunks if c.get("score") is not None]
+        relevance = f"{max(scores):.2f}" if scores else "—"
+        self._apply_session_values(
+            {
+                "s-epoch": self._era_short(chunks),
+                "s-count": str(len(chunks)),
+                "s-relevance": relevance,
+                "s-theme": THEME_DISPLAY_NAMES.get(self.theme, self.theme),
+            }
+        )
+
+    @staticmethod
+    def _era_short(chunks: list[dict]) -> str:
+        counts: dict[str, int] = {}
+        for chunk in chunks:
+            era = chunk.get("era")
+            if era:
+                counts[era] = counts.get(era, 0) + 1
+        if not counts:
+            return "—"
+        era = max(counts, key=counts.get)
+        return {"heresy": "M30-31", "current": "M41-42"}.get(era, "—")
+
+    def _apply_session_values(self, values: dict[str, str]) -> None:
+        for widget_id, value in values.items():
+            if self._session_targets.get(widget_id) == value:
+                continue
+            self._session_targets[widget_id] = value
+            widget = self.query_one(f"#{widget_id}", Static)
+            if self._crt_on:
+                self._scramble_value(widget_id, SESSION_LABELS[widget_id], value)
+            else:
+                widget.update(self._session_row(SESSION_LABELS[widget_id], value))
+
+    def _scramble_value(self, widget_id: str, label: str, value: str) -> None:
+        state = self._scramble_states.get(widget_id)
+        if state is None:
+            state = {"label": label, "target": value, "shown": 0}
+            self._scramble_states[widget_id] = state
+        else:
+            state["label"] = label
+            state["target"] = value
+            state["shown"] = min(state["shown"], len(value))
+        if self._fx_scramble_timer is None:
+            self._fx_scramble_timer = self.set_interval(SCRAMBLE_TICK, self._scramble_tick)
+
+    def _scramble_tick(self) -> None:
+        if not self._crt_on:
+            self._scramble_finish_all()
+            return
+        done: list[str] = []
+        for widget_id, state in list(self._scramble_states.items()):
+            target = state["target"]
+            shown = min(state["shown"] + SCRAMBLE_STEP, len(target))
+            state["shown"] = shown
+            widget = self.query_one(f"#{widget_id}", Static)
+            if shown >= len(target):
+                done.append(widget_id)
+                widget.update(self._session_row(state["label"], target))
+            else:
+                tail = "".join(
+                    random.choice(SCRAMBLE_GLYPHS) for _ in range(len(target) - shown)
+                )
+                widget.update(self._session_row(state["label"], target[:shown] + tail))
+        for widget_id in done:
+            self._scramble_states.pop(widget_id, None)
+        if not self._scramble_states:
+            self._stop_timer(self._fx_scramble_timer)
+            self._fx_scramble_timer = None
+
+    def _scramble_finish_all(self) -> None:
+        for widget_id, state in list(self._scramble_states.items()):
+            try:
+                self.query_one(f"#{widget_id}", Static).update(
+                    self._session_row(state["label"], state["target"])
+                )
+            except Exception:
+                pass
+        self._scramble_states.clear()
+        self._stop_timer(self._fx_scramble_timer)
+        self._fx_scramble_timer = None
+
     def action_toggle_sources(self) -> None:
-        self._panel_on = not self._panel_on
-        self._apply_panel_visibility()
-        self._save_config()
+        self._set_panel(not self._panel_on)
         if self._panel_on and not self._last_chunks:
             self._set_status("Источников пока нет — сначала задайте вопрос.")
         else:
@@ -881,19 +1413,18 @@ class MechanicusApp(App):
                 "Панель источников " + ("открыта." if self._panel_on else "скрыта.")
             )
 
-    # ------------------------------------------------------------------ темы
     def set_theme(self, name: str) -> None:
         if name not in THEME_NAMES:
             return
         self.theme = name
         self._save_config()
         self._set_status(f"Тема: {THEME_DISPLAY_NAMES[name]}.")
+        self._apply_session_values({"s-theme": THEME_DISPLAY_NAMES[name]})
 
     def action_cycle_theme(self) -> None:
         idx = (THEME_NAMES.index(self.theme) + 1) % len(THEME_NAMES)
         self.set_theme(THEME_NAMES[idx])
 
-    # --------------------------------------------------------------- журнал
     def action_scroll_log_up(self) -> None:
         self._chat().scroll_page_up()
 
@@ -904,7 +1435,6 @@ class MechanicusApp(App):
         self._chat().remove_children()
         self._set_status("Журнал очищен.")
 
-    # ------------------------------------------------------------- диалоги
     def action_settings(self) -> None:
         self.push_screen(SettingsModal())
 
@@ -912,7 +1442,6 @@ class MechanicusApp(App):
         self.push_screen(HelpModal())
 
     def action_command_palette(self) -> None:
-        # SimpleCommand(name, callback, help_text) — порядок важен.
         commands = [
             SimpleCommand("Показать или скрыть источники", self.action_toggle_sources, "Ctrl+F"),
             SimpleCommand("Сменить тему", self.action_cycle_theme, "Ctrl+T"),
@@ -928,7 +1457,6 @@ class MechanicusApp(App):
     def action_quit(self) -> None:
         self.exit()
 
-    # ----------------------------------------------------------- история ввода
     def history_step(self, delta: int) -> None:
         inp = self.query_one("#question", QuestionInput)
         if not self._input_history:
@@ -945,7 +1473,6 @@ class MechanicusApp(App):
             self._hist_idx = new_idx
         inp.action_end()
 
-    # ------------------------------------------------------------------ ввод
     @on(Input.Submitted, "#question")
     def _on_question(self, event: Input.Submitted) -> None:
         question = (event.value or "").strip()
@@ -993,69 +1520,115 @@ class MechanicusApp(App):
             self._set_status("Машинный Дух обрабатывает запрос...")
             self._ask_worker(question, None)
 
-    # ------------------------------------------------------- печатная машинка
+    @staticmethod
+    def _format_reply(text: str) -> tuple[str | None, Text]:
+        lines = text.split("\n")
+        heading = None
+        body = text
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("**") and s.endswith("**") and s.count("**") == 2:
+                heading = s[2:-2].strip()
+                body = "\n".join(lines[i + 1:])
+            break
+
+        out = Text()
+        for i, part in enumerate(body.strip().split("**")):
+            if not part:
+                continue
+            if i % 2 == 1:
+                out.append(
+                    part,
+                    style=Style.combine((STYLE_DARK_GREEN, Style(bold=True))),
+                )
+            else:
+                out.append(part, style=STYLE_DARK_GREEN)
+        return heading, out
+
     def _type_reply(self, text: str) -> None:
+        heading, body = self._format_reply(text)
         self._typing_active = True
-        self._typing_widget = Static(Text("", style=STYLE_DARK_GREEN), markup=False)
         chat = self._chat()
         at_end = chat.is_vertical_scroll_end
+
+        self._headline_widget = None
+        if heading:
+            band = Static(Text(""), markup=False, classes="hl-band")
+            chat.mount(band)
+            self._headline_widget = band
+
+        self._typing_widget = Static(Text(""), markup=False)
         chat.mount(self._typing_widget)
         if at_end:
             chat.scroll_end(force=True)
-        self._type_out_worker(text)
+        self._type_out_worker(heading, body)
 
     @work(thread=False, group="typing", exclusive=True)
-    async def _type_out_worker(self, text: str) -> None:
+    async def _type_out_worker(self, heading: str | None, body: Text) -> None:
+        band = self._headline_widget
         widget = self._typing_widget
         chat = self._chat()
         delay = self._typing_delay
         try:
-            if delay <= 0:
-                widget.update(Text(text, style=STYLE_DARK_GREEN))
-            else:
-                buf: list[str] = []
-                chunk_size = 4
-                for ch in text:
-                    if self._skip_typing:
-                        break
-                    buf.append(ch)
-                    if len(buf) % chunk_size == 0:
+            if heading is not None and band is not None:
+                full = Text(heading)
+                if delay <= 0:
+                    band.update(full)
+                else:
+                    n = 0
+                    total = len(full)
+                    while n < total:
+                        if self._skip_typing:
+                            break
+                        n = min(n + 4, total)
                         at_end = chat.is_vertical_scroll_end
-                        widget.update(Text("".join(buf), style=STYLE_DARK_GREEN))
+                        band.update(full[:n])
                         if at_end:
                             chat.scroll_end(force=True)
-                        await asyncio.sleep(delay * chunk_size)
-                widget.update(Text(text, style=STYLE_DARK_GREEN))
+                        await asyncio.sleep(delay * 4)
+                    band.update(full)
+
+            if delay <= 0:
+                widget.update(body)
+            else:
+                n = 0
+                total = len(body)
+                while n < total:
+                    if self._skip_typing:
+                        break
+                    n = min(n + 4, total)
+                    at_end = chat.is_vertical_scroll_end
+                    widget.update(body[:n])
+                    if at_end:
+                        chat.scroll_end(force=True)
+                    await asyncio.sleep(delay * 4)
+                widget.update(body)
         finally:
-            self._skip_typing = False
-            self._typing_active = False
-            self._append_msg(
-                Text(
-                    "(наберите /sources, чтобы увидеть источники ответа)",
-                    style=STYLE_DIM,
+            try:
+                self._skip_typing = False
+                self._typing_active = False
+                self._append_msg(
+                    Text(
+                        "(наберите /sources, чтобы увидеть источники ответа)",
+                        style=STYLE_DIM,
+                    )
                 )
-            )
-            self._set_busy(False)
-            self._set_status("Готов к приёму запроса.")
-            self.query_one("#question", QuestionInput).focus()
+                self._set_busy(False)
+                self._set_status("Готов к приёму запроса.")
+                self.query_one("#question", QuestionInput).focus()
+            except Exception:
+                self._skip_typing = False
+                self._typing_active = False
 
     def on_key(self, event: events.Key) -> None:
-        """Любая клавиша во время печати ответа — мгновенно допечатывает его
-        целиком (как пропуск анимации), не отправляя клавишу дальше."""
         if self._typing_active:
             self._skip_typing = True
             event.stop()
 
-    # ------------------------------------------------------------ RAG-воркеры
     @work(thread=True, group="answer", exclusive=True)
     def _ask_worker(self, question: str, era_override: list[dict] | None):
-        # Textual на время работы подменяет sys.stderr своей заглушкой
-        # (fileno() == -1). Если внутри answer() какая-то библиотека лениво
-        # создаст multiprocessing-примитив (так делает tqdm при первом
-        # trange в sentence-transformers), resource_tracker попытается
-        # заспавнить свой процесс с fds_to_pass=[sys.stderr.fileno()=-1, ...]
-        # и упадёт с ValueError("bad value(s) in fds_to_keep"). На время
-        # вызова возвращаем stderr настоящий файловый дескриптор (/dev/null).
         with contextlib.redirect_stderr(_DEVNULL_STDERR):
             try:
                 reply, chunks = answer(question, era_chunks_override=era_override)
@@ -1076,9 +1649,6 @@ class MechanicusApp(App):
         def on_stage(stage_key: str) -> None:
             self.call_from_thread(self._set_boot_stage, stage_key)
 
-        # То же самое, что в _ask_worker: прогрев грузит модели внутри
-        # Textual-воркера, а загрузка тоже может лениво создавать
-        # multiprocessing-примитивы (см. комментарий выше).
         with contextlib.redirect_stderr(_DEVNULL_STDERR):
             try:
                 warm_up(on_stage=on_stage)
@@ -1093,7 +1663,7 @@ class MechanicusApp(App):
             return
         key = (id(worker), worker.state.name)
         if key in self._handled_worker_events:
-            return  # дубль доставки события в Textual 8 (см. __init__)
+            return
         self._handled_worker_events.add(key)
         if worker.name == "_boot_worker_run":
             self._finish_boot_worker(worker)
@@ -1102,11 +1672,6 @@ class MechanicusApp(App):
 
     @work(thread=False, group="boot-finish", exclusive=True)
     async def _finish_boot_worker(self, worker: Worker) -> None:
-        """Завершение прогрева: pop_screen() асинхронный, поэтому сначала
-        дожидаемся снятия BootScreen, и только потом пишем в журнал главного
-        экрана. Сразу после pop_screen() Textual ещё пересобирает дерево
-        главного экрана (часть виджетов на миг отсутствует), поэтому ждём,
-        пока #chat-scroll снова доступен в DOM."""
         result = worker.result
         if self._boot_screen is not None:
             self._boot_screen = None
@@ -1123,7 +1688,6 @@ class MechanicusApp(App):
         self.query_one("#question", QuestionInput).focus()
 
     async def _wait_for_chat(self, timeout: float = 5.0) -> None:
-        """Ждёт, пока главный экран пересоберётся после смены экранов."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
@@ -1131,14 +1695,16 @@ class MechanicusApp(App):
                 return
             except Exception:
                 await asyncio.sleep(0.01)
-        self.query_one("#chat-scroll", VerticalScroll)  # последняя попытка — дать честную ошибку
+        self.query_one("#chat-scroll", VerticalScroll)
 
     def _finish_ask(self, worker: Worker) -> None:
         result = worker.result
         kind = result.get("kind")
 
         if kind == "ok":
-            self._update_sources(result.get("chunks", []))
+            chunks = result.get("chunks", [])
+            self._update_session_data(chunks)
+            self._update_sources(chunks)
             self._set_status("Протокол поиска завершён.")
             if self._sounds:
                 play_sound("answer")
@@ -1158,7 +1724,6 @@ class MechanicusApp(App):
             self.push_screen(EraModal(self._pending_by_era), callback=self._on_era_chosen)
             return
 
-        # kind == "error"
         self._set_busy(False)
         self._append_msg(Text(result.get("text", "Неизвестная ошибка."), style=STYLE_DIM))
         self._set_status("Ошибка обработки запроса.")
@@ -1180,7 +1745,6 @@ class MechanicusApp(App):
         self._set_status("Машинный Дух обрабатывает запрос...")
         self._ask_worker(self._pending_question, chunks)
 
-    # ------------------------------------------------------------------ boot
     def _start_boot(self) -> None:
         self._boot_idx = 0
         self._boot_stage_started = time.monotonic()
@@ -1195,29 +1759,88 @@ class MechanicusApp(App):
                 self._boot_stage_started = time.monotonic()
                 return
 
+    def _scan_tick(self) -> None:
+        if not self._crt_on:
+            return
+        try:
+            frame = self.query_one("#log-frame")
+            height = max(1, frame.content_size.height - 1)
+            self._scan_y += height / (SCANLINE_PERIOD / SCANLINE_TICK)
+            self.query_one("#scanline").styles.offset = Offset(0, int(self._scan_y) % height)
+        except Exception:
+            pass
+
+    def _schedule_flicker(self) -> None:
+        if not self._crt_on:
+            return
+        self._fx_flicker_timer = self.set_timer(
+            random.uniform(FLICKER_MIN, FLICKER_MAX), self._do_flicker
+        )
+
+    def _do_flicker(self) -> None:
+        self._fx_flicker_timer = None
+        if not self._crt_on:
+            return
+        band = self._headline_widget
+        if band is not None and band.is_attached:
+            band.add_class("-flicker")
+            self._fx_flicker_timer = self.set_timer(
+                random.uniform(FLICKER_HOLD_MIN, FLICKER_HOLD_MAX), self._end_flicker
+            )
+        else:
+            self._schedule_flicker()
+
+    def _end_flicker(self) -> None:
+        self._fx_flicker_timer = None
+        band = self._headline_widget
+        if band is not None and band.is_attached:
+            band.remove_class("-flicker")
+        self._schedule_flicker()
+
+    def _start_crt_effects(self) -> None:
+        if not self._crt_on:
+            return
+        self.query_one("#scanline").add_class("-on")
+        if self._fx_scan_timer is None:
+            self._fx_scan_timer = self.set_interval(SCANLINE_TICK, self._scan_tick)
+        self._schedule_flicker()
+        if self._busy and self._fx_pulse_timer is None:
+            self._fx_pulse_timer = self.set_interval(PULSE_TICK, self._pulse_tick)
+
+    def _stop_crt_effects(self) -> None:
+        for timer in (
+            self._fx_scan_timer,
+            self._fx_flicker_timer,
+            self._fx_pulse_timer,
+            self._fx_scramble_timer,
+            self._fx_flash_timer,
+        ):
+            self._stop_timer(timer)
+        self._fx_scan_timer = None
+        self._fx_flicker_timer = None
+        self._fx_pulse_timer = None
+        self._fx_scramble_timer = None
+        self._fx_flash_timer = None
+        self._scramble_finish_all()
+        try:
+            self.query_one("#scanline").remove_class("-on")
+            self.query_one("#status-row").remove_class("-pulse-alt", "-flash")
+        except Exception:
+            pass
+        if self._headline_widget is not None and self._headline_widget.is_attached:
+            self._headline_widget.remove_class("-flicker")
+
 
 def _prewarm_subprocess_primitives() -> None:
-    """Создаёт multiprocessing-примитивы, которые библиотеки обычно создают
-    лениво, ДО того как Textual подменит sys.stderr своей заглушкой.
-
-    Без этого первый вопрос в TUI падает с «Ошибка обращения к DeepSeek:
-    bad value(s) in fds_to_keep»: sentence-transformers при encode() вызывает
-    tqdm.trange, tqdm при первом вызове создаёт multiprocessing.RLock,
-    а multiprocessing.resource_tracker при этом спавнит свой процесс,
-    передавая туда sys.stderr.fileno() — внутри Textual это -1, что
-    _posixsubprocess отвергает. Здесь лок создаётся заранее (в главном
-    потоке, пока stderr ещё настоящий), и спавн tracker'а проходит штатно.
-    """
     try:
         from tqdm import tqdm as _tqdm
 
         _tqdm.get_lock()
     except Exception:
-        pass  # tqdm недоступен/сломан — воркеры всё равно защищены redirect'ом в _ask_worker
+        pass
 
 
 def run() -> None:
-    """Точка входа для chat.py."""
     _prewarm_subprocess_primitives()
     MechanicusApp().run()
 

@@ -486,12 +486,28 @@ def kill_orphaned_background_music() -> None:
         pass  # pkill недоступен (Windows) — просто пропускаем
 
 
+def _terminate_process(proc: subprocess.Popen) -> None:
+    """Завершает процесс плеера, игнорируя случаи, когда он уже умер сам."""
+    try:
+        proc.terminate()
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def start_background_music() -> None:
     """Запускает фоновую музыку на репите в фоновом потоке (не shell-цикле —
     команда воспроизведения разная на каждой ОС, см. _sound_player_cmd).
-    Не блокирует CLI. Тихо ничего не делает, если файла нет или на этой ОС
-    не нашлось проигрывателя."""
+    Не блокирует CLI. Тихо ничего не делает, если музыка уже играет, файла
+    нет или на этой ОС не нашлось проигрывателя.
+
+    Повторный вызов при уже играющей музыке раньше заводил ВТОРОЙ поток со
+    своим stop-событием: stop_background_music() останавливал только последний
+    поток, а старый продолжал крутить трек (и перезапускал его заново после
+    завершения) — переключатель в настройках переставал выключать музыку.
+    Поэтому здесь функция идемпотентна: второй поток не создаётся."""
     global _background_stop, _background_thread
+    if _background_stop is not None and not _background_stop.is_set():
+        return  # музыка уже играет — ничего не перезапускаем
     if not BACKGROUND_MUSIC_FILE.exists():
         return
     cmd = _sound_player_cmd(str(BACKGROUND_MUSIC_FILE))
@@ -504,38 +520,42 @@ def start_background_music() -> None:
     def _loop(stop_event: threading.Event) -> None:
         global _background_proc
         while True:
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            except OSError:
+                return  # плеер пропал/не запускается — молча выходим
             with _background_lock:
                 if stop_event.is_set():
+                    # stop() успел выставиться, пока мы спавнили процесс, —
+                    # не даём треку заиграть и завершаем поток.
+                    _terminate_process(proc)
                     return
-                try:
-                    _background_proc = subprocess.Popen(
-                        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                    )
-                except FileNotFoundError:
-                    return
-            _background_proc.wait()
+                _background_proc = proc
+            proc.wait()
 
     _background_thread = threading.Thread(target=_loop, args=(_background_stop,), daemon=True)
     _background_thread.start()
 
 
 def stop_background_music() -> None:
-    """Останавливает музыку и гарантированно не оставляет висящий процесс:
+    """Останавливает музыку и гарантированно не оставляет висящий процесс.
     _background_lock синхронизирует это с _loop() выше — иначе возможна
     гонка (проверили stop_event, ещё не успели запустить/сохранить в
     _background_proc новый процесс — а stop() тем временем уже прочитал
     старое значение и завершился, новый процесс остаётся играть трек
-    до конца, никем не остановленный)."""
+    до конца, никем не остановленный). Процесс, который _loop() спавнит
+    в тот же момент, обрабатывается внутри _loop(): он видит выставленный
+    stop_event под локом и убивает процесс сам."""
     global _background_stop, _background_thread, _background_proc
     if _background_stop is None:
         return
     with _background_lock:
         _background_stop.set()
-        if _background_proc is not None:
-            try:
-                _background_proc.terminate()
-            except (ProcessLookupError, PermissionError):
-                pass
+        proc = _background_proc
+        _background_proc = None
+        if proc is not None:
+            _terminate_process(proc)
     _background_stop = None
     _background_thread = None
-    _background_proc = None
