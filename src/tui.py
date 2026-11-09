@@ -1,25 +1,28 @@
 import asyncio
 import contextlib
+import ctypes
 import json
 import os
 import random
+import socket
+import subprocess
+import sys
 import time
+from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from rich.style import Style
 from rich.text import Text
 from textual import events, on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.command import SimpleCommand
 from textual.containers import Center, Horizontal, Vertical, VerticalScroll
-from textual.geometry import Offset
 from textual.screen import ModalScreen, Screen
 from textual.theme import Theme
 from textual.timer import Timer
 from textual.widgets import (
     Button,
-    Footer,
     Input,
     LoadingIndicator,
     SelectionList,
@@ -28,7 +31,9 @@ from textual.widgets import (
 )
 from textual.worker import Worker, WorkerState
 
+from auth import change_password, verify_credentials
 from generator import (
+    DEEPSEEK_BASE_URL,
     ERA_LABELS,
     AccessDeniedError,
     EraClarificationNeeded,
@@ -37,12 +42,18 @@ from generator import (
 )
 from persona import IDENTITY_RESPONSES, _is_identity_question
 from retriever import BOOT_STAGES, models_cached, warm_up
+from startup import RevealEffects, StartupManager
 from ui import (
     GREETING_VARIANTS,
     play_sound,
     start_background_music,
     stop_background_music,
 )
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 BRASS = "#d7af5f"
 BONE = "#ffd7af"
@@ -68,28 +79,36 @@ TYPEWRITER_DELAY = 0.012
 
 STAGE_MAX_WIDTH = 132
 PANEL_AUTO_WIDTH = 120
-SCRAMBLE_GLYPHS = "▓▒░█▚▞◇◈┼╳"
-SCRAMBLE_TICK = 0.045
-SCRAMBLE_STEP = 2
-FLICKER_MIN = 3.0
-FLICKER_MAX = 8.0
-FLICKER_HOLD_MIN = 0.06
-FLICKER_HOLD_MAX = 0.1
-SCANLINE_PERIOD = 5.0
-SCANLINE_TICK = 0.12
+SCENE_WIDTH_DOCKED = 158
+DOCK_WIDTH = 26
+DOCK_MIN_LOG_WIDTH = 50
+
+CLOCK_INTERVAL = 1.0
+DOCK_DATA_INTERVAL = 5.0
+PING_INTERVAL = 10.0
+PING_PORT = 443
+PING_TIMEOUT = 2.0
+PING_GOOD_MS = 150
+PING_WARN_MS = 400
+PING_HOST = urlsplit(DEEPSEEK_BASE_URL).hostname or "api.deepseek.com"
+
+WEEKDAY_NAMES = ("ПОНЕДЕЛЬНИК", "ВТОРНИК", "СРЕДА", "ЧЕТВЕРГ", "ПЯТНИЦА", "СУББОТА", "ВОСКРЕСЕНЬЕ")
+MONTH_NAMES = ("ЯНВАРЯ", "ФЕВРАЛЯ", "МАРТА", "АПРЕЛЯ", "МАЯ", "ИЮНЯ", "ИЮЛЯ", "АВГУСТА", "СЕНТЯБРЯ", "ОКТЯБРЯ", "НОЯБРЯ", "ДЕКАБРЯ")
+
 STATUS_FLASH = 0.15
-PULSE_TICK = 0.45
-HEADER_TICK = 0.03
-BANNER_TICK = 0.12
+HEADER_TICK = 0.05
+BANNER_TICK = 0.25
 BOOT_TYPE_TICK = 0.03
 BOOT_TYPE_STEP = 2
 
-SESSION_LABELS = {
-    "s-epoch": "ЭПОХА:",
-    "s-count": "ФРАГМЕНТОВ:",
-    "s-relevance": "РЕЛЕВАНТНОСТЬ:",
-    "s-theme": "ТЕМА:",
-}
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_WINDOW_WIDTH = 40
+STARTUP_LINE_TEXT = "▌ ЗАПУСК АРХИВНОГО ТЕРМИНАЛА"
+STARTUP_BOOT_PAUSE = 0.8
+STARTUP_FRAME_FADE = 0.3
+STARTUP_ROW_FADE = 0.15
+STARTUP_GUTTER_FADE = 0.3
+STARTUP_STATUS_PAUSE = 0.2
 
 THEME_NAMES = ("mechanicus", "mechanicus-dark", "mechanicus-void")
 THEME_DISPLAY_NAMES = {
@@ -106,6 +125,7 @@ COMMANDS = (
     "/clear",
     "/exit",
     "/help",
+    "/passwd",
     "/quit",
     "/sources",
     "/theme",
@@ -115,6 +135,7 @@ COMMAND_DESCRIPTIONS = {
     "/clear": "очистить журнал",
     "/exit": "завершить сеанс",
     "/help": "справка по клавишам",
+    "/passwd": "сменить пароль",
     "/quit": "завершить сеанс",
     "/sources": "источники последнего ответа",
     "/theme": "сменить тему",
@@ -127,7 +148,8 @@ CONFIG_DEFAULTS = {
     "typing": True,
     "music": True,
     "panel": False,
-    "crt": True,
+    "left_dock": False,
+    "startup_reveal": True,
 }
 
 EXPECTED_BOOT_SECONDS = [1.0, 4.0, 5.0, 90.0]
@@ -135,8 +157,69 @@ EXPECTED_BOOT_SECONDS = [1.0, 4.0, 5.0, 90.0]
 _DEVNULL_STDERR = open(os.devnull, "w", encoding="utf-8")
 
 
+class _WinPowerStatus(ctypes.Structure):
+    _fields_ = [
+        ("ACLineStatus", ctypes.c_byte),
+        ("BatteryFlag", ctypes.c_byte),
+        ("BatteryLifePercent", ctypes.c_ubyte),
+        ("Reserved1", ctypes.c_byte),
+        ("BatteryLifeTime", ctypes.c_ulong),
+        ("BatteryFullLifeTime", ctypes.c_ulong),
+    ]
+
+
+def _battery_text() -> str:
+    if psutil is not None:
+        try:
+            battery = psutil.sensors_battery()
+        except Exception:
+            battery = None
+        if battery is not None:
+            return f"{round(battery.percent)}%"
+    try:
+        if sys.platform == "darwin":
+            out = subprocess.check_output(["pmset", "-g", "batt"], text=True)
+            for part in out.split():
+                if part.rstrip(";,").endswith("%"):
+                    digits = part.rstrip(";,%")
+                    if digits.isdigit():
+                        return f"{int(digits)}%"
+            return "ОТ СЕТИ"
+        if sys.platform == "linux":
+            for base in ("/sys/class/power_supply/BAT0", "/sys/class/power_supply/BAT1"):
+                cap_file = Path(base) / "capacity"
+                if cap_file.exists():
+                    return f"{int(cap_file.read_text(encoding='utf-8').strip())}%"
+        if sys.platform == "win32":
+            status = _WinPowerStatus()
+            if ctypes.windll.kernel32.GetSystemPowerStatus(ctypes.byref(status)):
+                if status.BatteryLifePercent == 255:
+                    return "ОТ СЕТИ"
+                return f"{status.BatteryLifePercent}%"
+    except Exception:
+        pass
+    return "Н/Д"
+
+
+def _measure_ping(host: str) -> tuple[str, Style]:
+    started = time.monotonic()
+    try:
+        with socket.create_connection((host, PING_PORT), timeout=PING_TIMEOUT):
+            pass
+    except OSError:
+        return "ОФЛАЙН", STYLE_BLOOD
+    ms = (time.monotonic() - started) * 1000
+    if ms < PING_GOOD_MS:
+        style = STYLE_GREEN
+    elif ms <= PING_WARN_MS:
+        style = STYLE_BRASS
+    else:
+        style = STYLE_BLOOD
+    return f"{ms:.0f} мс", style
+
+
 def _make_theme(
-    name: str, bg: str, surface: str, panel: str, fg: str, frame: str, scanline: str
+    name: str, bg: str, surface: str, panel: str, fg: str, frame: str
 ) -> Theme:
     return Theme(
         name=name,
@@ -168,21 +251,20 @@ def _make_theme(
             "phosphor-bright": PHOSPHOR_BRIGHT,
             "alert": ALERT,
             "frame": frame,
-            "scanline": scanline,
         },
     )
 
 
 def _all_themes() -> list[Theme]:
     return [
-        _make_theme("mechanicus", "#0a0c0a", "#0f130f", "#161d16", BONE, "#445544", "#1a2b12"),
-        _make_theme("mechanicus-dark", "#030403", "#080a08", "#0e120e", "#e8c9a5", "#5f8c3a", "#243d18"),
-        _make_theme("mechanicus-void", "#101308", "#161c0f", "#1d2512", "#d9bfa0", "#3a4434", "#0f1a0a"),
+        _make_theme("mechanicus", "#0a0c0a", "#0f130f", "#161d16", BONE, "#445544"),
+        _make_theme("mechanicus-dark", "#030403", "#080a08", "#0e120e", "#e8c9a5", "#5f8c3a"),
+        _make_theme("mechanicus-void", "#101308", "#161c0f", "#1d2512", "#d9bfa0", "#3a4434"),
     ]
 
 
 def _build_input_bindings() -> list[Binding]:
-    removed = {"ctrl+k", "ctrl+u", "ctrl+d"}
+    removed = {"ctrl+u", "ctrl+d"}
     keep: list[Binding] = []
     for b in Input.BINDINGS:
         keys = [k.strip() for k in b.key.split(",")]
@@ -200,7 +282,6 @@ def _build_input_bindings() -> list[Binding]:
                 tooltip=b.tooltip,
             )
         )
-    keep.append(Binding("ctrl+k", "app_command_palette", "Палитра", show=False, priority=True))
     keep.append(Binding("ctrl+u", "app_scroll_log_up", "Вверх", show=False, priority=True))
     keep.append(Binding("ctrl+d", "app_scroll_log_down", "Вниз", show=False, priority=True))
     keep.append(Binding("up", "history_prev", "Предыдущий вопрос", show=False))
@@ -239,9 +320,6 @@ class QuestionInput(Input):
 
     def action_history_next(self) -> None:
         self.app.history_step(1)
-
-    def action_app_command_palette(self) -> None:
-        self.app.action_command_palette()
 
     def action_app_scroll_log_up(self) -> None:
         self.app.action_scroll_log_up()
@@ -330,6 +408,10 @@ class QuestionInput(Input):
 
 
 class FillerPanel(Static):
+    def __init__(self, *args, seed: int = 0, **kwargs) -> None:
+        self._seed = seed
+        super().__init__(*args, **kwargs)
+
     def render(self) -> Text:
         width, height = self.size
         if width < 2 or height < 1:
@@ -339,11 +421,11 @@ class FillerPanel(Static):
         for y in range(height):
             row = []
             for x in range(width):
-                value = (x * 7 + y * 13) % 97
+                value = (x * 7 + y * 13 + self._seed * 37) % 97
                 if value < 44:
                     row.append(" ")
                 elif value < 92:
-                    row.append(glyphs[(x * 5 + y * 11) % len(glyphs)])
+                    row.append(glyphs[(x * 5 + y * 11 + self._seed * 17) % len(glyphs)])
                 else:
                     row.append("▓")
             out.append("".join(row) + "\n", style=STYLE_IRON)
@@ -418,7 +500,7 @@ class HelpModal(ModalScreen):
     def _help_text() -> Text:
         rows = [
             ("Ctrl+F", "показать/скрыть панель источников последнего ответа"),
-            ("Ctrl+K / Ctrl+P", "командная палитра"),
+            ("Ctrl+B", "показать/скрыть левую панель «Система»"),
             ("Ctrl+S", "настройки (звук, печатная машинка, музыка, тема)"),
             ("Ctrl+T", "следующая тема (палитра цветов не меняется)"),
             ("Ctrl+U / Ctrl+D", "прокрутка журнала вверх/вниз"),
@@ -428,8 +510,6 @@ class HelpModal(ModalScreen):
             ("Ctrl+L", "очистить журнал"),
             ("F1", "эта справка"),
             ("Ctrl+C / Ctrl+Q", "выход"),
-            ("/sources", "источники последнего ответа"),
-            ("/exit", "выход"),
         ]
         out = Text()
         for key, desc in rows:
@@ -489,8 +569,8 @@ class SettingsModal(ModalScreen):
                     yield Static("Панель источников", classes="setting-label")
                     yield Switch(value=False, id="sw-panel")
                 with Horizontal(classes="setting-row"):
-                    yield Static("Эффекты CRT", classes="setting-label")
-                    yield Switch(value=False, id="sw-crt")
+                    yield Static("Левая панель", classes="setting-label")
+                    yield Switch(value=False, id="sw-dock")
                 yield Static(
                     Text("Тема (палитра не меняется — только фон):", style=STYLE_BONE),
                     classes="setting-label",
@@ -514,7 +594,7 @@ class SettingsModal(ModalScreen):
         self.query_one("#sw-typing", Switch).value = app._typing_delay > 0
         self.query_one("#sw-music", Switch).value = app._music_on
         self.query_one("#sw-panel", Switch).value = app._panel_on
-        self.query_one("#sw-crt", Switch).value = app._crt_on
+        self.query_one("#sw-dock", Switch).value = app._dock_on
         self.query_one("#theme-list", SelectionList).select(app.theme)
 
     @on(Switch.Changed)
@@ -544,14 +624,12 @@ class SettingsModal(ModalScreen):
             if app._panel_on == value:
                 return
             app._set_panel(value)
-        elif switch_id == "sw-crt":
-            if app._crt_on == value:
+        elif switch_id == "sw-dock":
+            if app._dock_on == value:
                 return
-            app._crt_on = value
-            if value:
-                app._start_crt_effects()
-            else:
-                app._stop_crt_effects()
+            if not app._set_dock(value):
+                self.query_one("#sw-dock", Switch).value = app._dock_on
+                return
         else:
             return
         app._save_config()
@@ -565,6 +643,201 @@ class SettingsModal(ModalScreen):
     @on(Button.Pressed)
     def _on_done(self) -> None:
         self.dismiss(None)
+
+
+class LoginScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "quit_login", "Выход"),
+        Binding("up", "focus_login", "Логин", show=False),
+        Binding("down", "focus_password", "Пароль", show=False),
+    ]
+
+    CSS = """
+    Screen {
+        background: $bg;
+    }
+    #login-window {
+        width: 40;
+        height: auto;
+    }
+    #login-top, #login-bottom {
+        width: 100%;
+        height: auto;
+        color: $phosphor-bright;
+        text-style: bold;
+    }
+    #login-body {
+        width: 100%;
+        height: auto;
+        background: $bg;
+        padding: 1 2;
+    }
+    #login-label, #password-label {
+        width: 100%;
+        color: $dim-green;
+        margin-top: 1;
+    }
+    #login-error {
+        width: 100%;
+        height: 1;
+        color: $blood;
+        margin-top: 1;
+    }
+    #login-hint {
+        width: 100%;
+        height: 1;
+        color: $dim-green;
+        margin-top: 1;
+    }
+    #login-body Input {
+        width: 100%;
+        background: $surface;
+        color: $bone;
+        border: none;
+        padding: 0 1;
+    }
+    #login-body Input:focus {
+        background: $panel;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._attempts = 0
+        self._collapsing = False
+
+    def compose(self) -> ComposeResult:
+        outer = "╔" + "═" * (LOGIN_WINDOW_WIDTH - 2) + "╗"
+        inner = "┌" + "─" * (LOGIN_WINDOW_WIDTH - 2) + "┐"
+        outer_bottom = "╚" + "═" * (LOGIN_WINDOW_WIDTH - 2) + "╝"
+        inner_bottom = "└" + "─" * (LOGIN_WINDOW_WIDTH - 2) + "┘"
+        with Center():
+            with Vertical(id="login-window"):
+                yield Static(f"{outer}\n{inner}", id="login-top", markup=False)
+                with Vertical(id="login-body"):
+                    yield Static("LOGIN", id="login-label", markup=False)
+                    yield Input(id="login-input", placeholder="введите логин")
+                    yield Static("PASSWORD", id="password-label", markup=False)
+                    yield Input(id="password-input", password=True, placeholder="введите пароль")
+                    yield Static("", id="login-error", markup=False)
+                    yield Static("↑/↓ / Tab — переключение · Enter — вход · Esc — выход", id="login-hint", markup=False)
+                yield Static(f"{inner_bottom}\n{outer_bottom}", id="login-bottom", markup=False)
+
+    def on_mount(self) -> None:
+        self.query_one("#login-input", Input).focus()
+
+    def action_quit_login(self) -> None:
+        self.dismiss(False)
+
+    def action_focus_password(self) -> None:
+        self.query_one("#password-input", Input).focus()
+
+    def action_focus_login(self) -> None:
+        self.query_one("#login-input", Input).focus()
+
+    @on(Input.Submitted)
+    async def _on_submitted(self, event: Input.Submitted) -> None:
+        if self._collapsing:
+            return
+        self._collapsing = True
+        login = self.query_one("#login-input", Input).value.strip()
+        password = self.query_one("#password-input", Input).value
+        self.query_one("#login-input", Input).disabled = True
+        self.query_one("#password-input", Input).disabled = True
+        self._check_worker(login, password)
+
+    @work(thread=True, group="login-check", exclusive=True)
+    def _check_worker(self, login: str, password: str) -> None:
+        self.app.call_from_thread(self._process_login, verify_credentials(login, password))
+
+    @work(thread=False, group="login-apply", exclusive=True)
+    async def _process_login(self, ok: bool) -> None:
+        login_input = self.query_one("#login-input", Input)
+        password_input = self.query_one("#password-input", Input)
+        if ok:
+            self.query_one("#login-error").update(Text("ДОСТУП РАЗРЕШЁН", style=STYLE_GREEN))
+            await self._collapse()
+            return
+        self._attempts += 1
+        left = max(0, LOGIN_MAX_ATTEMPTS - self._attempts)
+        if left == 0:
+            self.query_one("#login-error").update(Text("Доступ запрещён. Завершение.", style=STYLE_BLOOD))
+            await asyncio.sleep(1.0)
+            self.dismiss(False)
+            return
+        self.query_one("#login-error").update(
+            Text(f"Неверный логин или пароль. Осталось попыток: {left}", style=STYLE_BLOOD)
+        )
+        password_input.value = ""
+        await asyncio.sleep(self._attempts)
+        login_input.disabled = False
+        password_input.disabled = False
+        login_input.focus()
+        self._collapsing = False
+
+    async def _collapse(self) -> None:
+        self.query_one("#login-body").styles.display = "none"
+        top = self.query_one("#login-top")
+        bottom = self.query_one("#login-bottom")
+        band = "╔" + "═" * (LOGIN_WINDOW_WIDTH - 2) + "╗"
+        thin = "┌" + "─" * (LOGIN_WINDOW_WIDTH - 2) + "┐"
+        band_bottom = "╚" + "═" * (LOGIN_WINDOW_WIDTH - 2) + "╝"
+        thin_bottom = "└" + "─" * (LOGIN_WINDOW_WIDTH - 2) + "┘"
+        steps = 5
+        for step in range(1, steps + 1):
+            top.update(Text("\n".join(band if i % 2 == 0 else thin for i in range(step))))
+            bottom.update(Text("\n".join(band_bottom if (step - 1 - i) % 2 == 0 else thin_bottom for i in range(step))))
+            await asyncio.sleep(0.09)
+        self.dismiss(True)
+
+
+class PasswordModal(ModalScreen):
+    BINDINGS = [Binding("escape", "close", "Закрыть")]
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def compose(self) -> ComposeResult:
+        with Center():
+            with Vertical(id="dialog"):
+                yield Static("Текущий пароль", classes="setting-label", markup=False)
+                yield Input(password=True, id="pw-old")
+                yield Static("Новый пароль", classes="setting-label", markup=False)
+                yield Input(password=True, id="pw-new")
+                yield Static("Повторите новый пароль", classes="setting-label", markup=False)
+                yield Input(password=True, id="pw-repeat")
+                yield Static("", id="pw-error", markup=False)
+                yield Static("Esc — отмена", id="pw-hint", markup=False)
+                with Horizontal(id="done-row"):
+                    yield Button("Сменить", id="done-btn", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#dialog").border_title = " СМЕНА ПАРОЛЯ "
+        self.query_one("#pw-old", Input).focus()
+
+    @on(Button.Pressed)
+    def _on_done(self) -> None:
+        current = self.query_one("#pw-old", Input).value
+        new = self.query_one("#pw-new", Input).value
+        repeat = self.query_one("#pw-repeat", Input).value
+        if new != repeat:
+            self.query_one("#pw-error").update(Text("Новые пароли не совпадают.", style=STYLE_BLOOD))
+            return
+        if len(new) < 4:
+            self.query_one("#pw-error").update(Text("Пароль слишком короткий.", style=STYLE_BLOOD))
+            return
+        self._change_worker(current, new)
+
+    @work(thread=True, group="passwd-check", exclusive=True)
+    def _change_worker(self, current: str, new: str) -> None:
+        self.app.call_from_thread(self._apply_change, change_password(current, new))
+
+    def _apply_change(self, ok: bool) -> None:
+        if ok:
+            self.app._set_status("Пароль изменён.")
+            self.dismiss(None)
+        else:
+            self.query_one("#pw-error").update(Text("Неверный текущий пароль.", style=STYLE_BLOOD))
 
 
 class BootScreen(Screen):
@@ -641,6 +914,43 @@ class MechanicusApp(App):
         background: $bg;
     }
 
+    .reveal-hidden {
+        opacity: 0;
+        visibility: hidden;
+    }
+
+    #startup-line {
+        width: 100%;
+        height: 1;
+        text-align: center;
+        color: $dim-green;
+        display: none;
+    }
+
+    #pw-error {
+        width: 100%;
+        height: 1;
+        color: $blood;
+    }
+
+    #pw-hint {
+        width: 100%;
+        height: 1;
+        color: $dim-green;
+    }
+
+    #dialog Input {
+        width: 100%;
+        background: $surface;
+        color: $bone;
+        border: none;
+        padding: 0 1;
+    }
+
+    #dialog Input:focus {
+        background: $panel;
+    }
+
     #header {
         height: 3;
         background: $bg;
@@ -678,6 +988,66 @@ class MechanicusApp(App):
         text-opacity: 0.35;
     }
 
+    #dock-col {
+        width: 26;
+        height: 1fr;
+        display: none;
+        background: $surface;
+        border: double $frame;
+        border-title-color: $phosphor-bright;
+        border-title-background: $bg;
+        border-title-style: bold;
+        padding: 0 1;
+    }
+
+    #dock-col.visible {
+        display: block;
+    }
+
+    #clock {
+        width: 100%;
+        height: 1;
+        text-align: center;
+        color: $phosphor-bright;
+        text-style: bold;
+    }
+
+    #dock-dow, #dock-date {
+        width: 100%;
+        height: 1;
+        text-align: center;
+        color: $dim-green;
+    }
+
+    #dock-filler {
+        width: 100%;
+        height: 1fr;
+        background: $surface;
+    }
+
+    #dock-data {
+        width: 100%;
+        height: 3;
+        background: $surface;
+        border-top: solid $frame;
+    }
+
+    .dock-row {
+        width: 100%;
+        height: 1;
+    }
+
+    .dock-label {
+        width: 8;
+        color: $dim-green;
+    }
+
+    .dock-value {
+        width: 1fr;
+        color: $bone;
+        content-align: right middle;
+    }
+
     #log-frame {
         width: 1fr;
         height: 1fr;
@@ -702,19 +1072,6 @@ class MechanicusApp(App):
         scrollbar-color-active: $phosphor-bright;
     }
 
-    #scanline {
-        layer: overlay;
-        width: 100%;
-        height: 1;
-        background: $scanline;
-        offset: 0 0;
-        display: none;
-    }
-
-    #scanline.-on {
-        display: block;
-    }
-
     .hl-band {
         width: 100%;
         height: auto;
@@ -724,10 +1081,6 @@ class MechanicusApp(App):
         padding: 0 1;
         margin-top: 1;
         margin-bottom: 1;
-    }
-
-    .hl-band.-flicker {
-        background: $dim-green;
     }
 
     .banner {
@@ -756,18 +1109,6 @@ class MechanicusApp(App):
         height: 1fr;
     }
 
-    #session-data {
-        height: 5;
-        background: $surface;
-        border-top: solid $frame;
-    }
-
-    #session-data Static {
-        width: 100%;
-        height: 1;
-        content-align: right middle;
-    }
-
     #status-row {
         height: 1;
         background: $alert;
@@ -785,10 +1126,6 @@ class MechanicusApp(App):
         opacity: 1;
         color: #0d0800;
         text-style: bold;
-    }
-
-    #status-row.-pulse-alt {
-        background: #d6660f;
     }
 
     #status-row.-flash {
@@ -840,34 +1177,6 @@ class MechanicusApp(App):
         color: $dim-green;
     }
 
-    #footer-row {
-        height: 2;
-        background: $panel;
-        border-top: solid $frame;
-    }
-
-    #footer-row Footer {
-        width: 1fr;
-        height: 1;
-        dock: none;
-        background: $panel;
-        color: $dull-brass;
-    }
-
-    FooterKey {
-        background: $iron;
-        color: $brass;
-    }
-
-    FooterKey.-command-palette {
-        background: $alert;
-        color: $bg;
-    }
-
-    FooterLabel {
-        color: $bone;
-    }
-
     #dialog {
         width: 66;
         height: auto;
@@ -895,7 +1204,7 @@ class MechanicusApp(App):
     }
 
     .setting-row {
-        height: 3;
+        height: 2;
     }
 
     .setting-label {
@@ -928,7 +1237,7 @@ class MechanicusApp(App):
     }
 
     Switch {
-        border: tall $frame;
+        border: none;
         background: $surface;
     }
 
@@ -942,7 +1251,7 @@ class MechanicusApp(App):
     }
 
     Switch:focus {
-        border: tall $phosphor-bright;
+        background: $panel;
     }
 
     Button {
@@ -963,75 +1272,12 @@ class MechanicusApp(App):
     #done-btn {
         dock: right;
     }
-
-    CommandPalette {
-        background: $bg 60%;
-    }
-
-    CommandPalette #--container {
-        width: 66;
-        height: auto;
-        border: heavy $frame;
-        background: $surface;
-        padding: 1 2;
-    }
-
-    CommandPalette #--input {
-        border: hkey $frame;
-        background: $panel;
-    }
-
-    CommandPalette #--input Label {
-        color: $phosphor-bright;
-        margin-top: 1;
-        margin-left: 1;
-    }
-
-    CommandPalette #--input Button {
-        min-width: 7;
-        margin-right: 1;
-    }
-
-    CommandPalette #--results {
-        overlay: none;
-        height: auto;
-    }
-
-    SearchIcon {
-        display: none;
-    }
-
-    CommandPalette Input {
-        color: $phosphor-bright;
-        background: $panel;
-    }
-
-    CommandPalette Input:focus {
-        border: none;
-        background: $panel;
-    }
-
-    CommandList {
-        background: $surface;
-    }
-
-    CommandList > .option-list--option {
-        color: $bone;
-        background: $surface;
-    }
-
-    CommandList > .option-list--option-highlighted {
-        color: $bg;
-        background: $phosphor-bright;
-        text-style: bold;
-    }
     """
 
     BINDINGS = [
         Binding("ctrl+f", "toggle_sources", "Источники"),
+        Binding("ctrl+b", "toggle_dock", "Система"),
         Binding("ctrl+t", "cycle_theme", "Тема"),
-        Binding("ctrl+k", "command_palette", "Палитра"),
-        Binding("ctrl+p", "command_palette", "Палитра", show=False),
         Binding("ctrl+s", "settings", "Настройки"),
         Binding("ctrl+u", "scroll_log_up", "Вверх"),
         Binding("ctrl+d", "scroll_log_down", "Вниз"),
@@ -1057,7 +1303,9 @@ class MechanicusApp(App):
         self._typing_delay: float = TYPEWRITER_DELAY if self._config["typing"] else 0.0
         self._music_on: bool = bool(self._config["music"])
         self._panel_on: bool = bool(self._config["panel"])
-        self._crt_on: bool = bool(self._config["crt"])
+        self._dock_on: bool = bool(self._config["left_dock"])
+        self._startup_reveal: bool = bool(self._config["startup_reveal"])
+        self._startup_done: bool = not self._startup_reveal
 
         self._busy = False
         self._typing_active = False
@@ -1069,22 +1317,24 @@ class MechanicusApp(App):
         self._pending_question = ""
         self._pending_by_era: dict[str, list[dict]] = {}
 
-        self._panel_manual: bool = False
+        self._panel_manual: bool = bool(self._config["panel"])
+        self._dock_manual: bool = bool(self._config["left_dock"])
+        self._last_clock: str = ""
+        self._last_dow: str = ""
+        self._last_date: str = ""
+        self._last_power: str = ""
+        self._last_ping: str = ""
         self._status_text: str = ""
         self._headline_widget: Static | None = None
         self._typing_widget: Static | None = None
-        self._scan_y: float = 0.0
-        self._session_targets: dict[str, str] = {}
-        self._scramble_states: dict[str, dict] = {}
         self._header_target: str = ""
         self._header_pos: int = 0
         self._banner_pairs: list[tuple[str, Style]] = []
         self._banner_idx: int = 0
+        self._header_event: asyncio.Event | None = None
+        self._banner_event: asyncio.Event | None = None
+        self._startup = StartupManager(self)
 
-        self._fx_scan_timer: Timer | None = None
-        self._fx_flicker_timer: Timer | None = None
-        self._fx_pulse_timer: Timer | None = None
-        self._fx_scramble_timer: Timer | None = None
         self._fx_flash_timer: Timer | None = None
         self._fx_header_timer: Timer | None = None
         self._fx_banner_timer: Timer | None = None
@@ -1113,7 +1363,8 @@ class MechanicusApp(App):
             typing=self._typing_delay > 0,
             music=self._music_on,
             panel=self._panel_on,
-            crt=self._crt_on,
+            left_dock=self._dock_on,
+            startup_reveal=self._startup_reveal,
         )
         try:
             CONFIG_PATH.write_text(
@@ -1124,72 +1375,99 @@ class MechanicusApp(App):
             pass
 
     def compose(self) -> ComposeResult:
+        reveal = self._startup_reveal
         with Vertical():
             with Vertical(id="header"):
                 yield Static("", id="header-line")
                 yield Static("", id="session-tag")
+            yield Static(STARTUP_LINE_TEXT, id="startup-line", markup=False)
             with Horizontal(id="main-row"):
-                yield FillerPanel(id="gutter-left", classes="gutter")
+                yield FillerPanel(id="gutter-left", classes="gutter reveal-hidden" if reveal else "gutter")
                 with Horizontal(id="main"):
-                    with Vertical(id="log-frame"):
+                    with Vertical(id="dock-col", classes="reveal-hidden" if reveal else ""):
+                        yield Static("", id="clock", markup=False, classes="reveal-hidden" if reveal else "")
+                        yield Static("", id="dock-dow", markup=False, classes="reveal-hidden" if reveal else "")
+                        yield Static("", id="dock-date", markup=False, classes="reveal-hidden" if reveal else "")
+                        yield FillerPanel(id="dock-filler", seed=7, classes="gutter reveal-hidden" if reveal else "gutter")
+                        with Vertical(id="dock-data", classes="reveal-hidden" if reveal else ""):
+                            with Horizontal(classes="dock-row reveal-hidden" if reveal else "dock-row"):
+                                yield Static("Питание", classes="dock-label")
+                                yield Static("Н/Д", id="d-power", classes="dock-value", markup=False)
+                            with Horizontal(classes="dock-row reveal-hidden" if reveal else "dock-row"):
+                                yield Static("Пинг", classes="dock-label")
+                                yield Static("—", id="d-ping", classes="dock-value", markup=False)
+                    with Vertical(id="log-frame", classes="reveal-hidden" if reveal else ""):
                         yield VerticalScroll(id="chat-scroll")
-                        yield Static("", id="scanline")
-                    with Vertical(id="sources-col"):
+                    with Vertical(id="sources-col", classes="reveal-hidden" if reveal else ""):
                         yield VerticalScroll(id="sources-list")
-                        with Vertical(id="session-data"):
-                            yield Static(markup=False, id="s-epoch")
-                            yield Static(markup=False, id="s-count")
-                            yield Static(markup=False, id="s-relevance")
-                            yield Static(markup=False, id="s-theme")
-                yield FillerPanel(id="gutter-right", classes="gutter")
-            with Horizontal(id="status-row"):
-                yield Static(markup=False, id="status")
+                yield FillerPanel(id="gutter-right", classes="gutter reveal-hidden" if reveal else "gutter")
+            with Horizontal(id="status-row", classes="reveal-hidden" if reveal else ""):
+                yield Static(markup=False, id="status", classes="reveal-hidden" if reveal else "")
                 yield LoadingIndicator(id="spinner")
-            with Horizontal(id="input-row"):
-                yield Static(">", id="prompt")
+            with Horizontal(id="input-row", classes="reveal-hidden" if reveal else ""):
+                yield Static(">", id="prompt", classes="reveal-hidden" if reveal else "")
                 yield QuestionInput(
                     placeholder="Вопрос к архиву…  (/help — справка · Tab — автодополнение)",
                     id="question",
+                    classes="reveal-hidden" if reveal else "",
                 )
-            with Horizontal(id="footer-row"):
-                yield Footer()
 
     def on_mount(self) -> None:
         self.query_one("#log-frame").border_title = " ЖУРНАЛ "
         self.query_one("#sources-col").border_title = " ИСТОЧНИКИ ПОСЛЕДНЕГО ОТВЕТА "
+        self.query_one("#dock-col").border_title = " СИСТЕМА "
 
         self._panel_manual = bool(self._config["panel"])
+        self._dock_manual = bool(self._config["left_dock"])
+        if not self._dock_manual:
+            self._dock_on = self._dock_auto_for(self._term_width())
+        self._apply_dock_visibility()
         self._apply_stage_width()
         if not self._panel_manual:
-            self._panel_on = self._stage_width() >= PANEL_AUTO_WIDTH
+            self._panel_on = self._stage_width() - (DOCK_WIDTH if self._dock_on else 0) >= PANEL_AUTO_WIDTH
         self._apply_panel_visibility()
         self._refresh_sources_placeholder()
-        self._init_session_data()
+        self._init_dock_data()
+        self.set_interval(CLOCK_INTERVAL, self._tick_clock)
+        self.set_interval(DOCK_DATA_INTERVAL, self._tick_dock_data)
+        self.set_interval(PING_INTERVAL, self._tick_ping)
 
-        self._set_status("Готов к приёму запроса.")
-        self._start_header_reveal()
+        self._set_status("")
+        if self._startup_reveal:
+            self.query_one("#question", QuestionInput).disabled = True
 
         if self._sounds:
             play_sound("startup")
+
+        self.push_screen(LoginScreen(), self._on_login_done)
+
+    def _on_login_done(self, ok: bool | None) -> None:
+        if not ok:
+            self.exit()
+            return
         if self._music_on:
             start_background_music()
-
         if not models_cached():
             self._start_boot()
+        elif self._startup_reveal:
+            self._startup.start()
         else:
+            self._set_status("Готов к приёму запроса.")
+            self._start_header_reveal()
             self.query_one("#question", QuestionInput).focus()
-
-        if self._crt_on:
-            self._start_crt_effects()
 
     def on_unmount(self) -> None:
         self._stop_timer(self._fx_header_timer)
         self._stop_timer(self._fx_banner_timer)
         self._fx_header_timer = None
         self._fx_banner_timer = None
-        self._stop_crt_effects()
+        self._startup.cancel()
+        self._stop_timer(self._fx_flash_timer)
+        self._fx_flash_timer = None
         if not self._panel_manual:
             self._panel_on = bool(self._config["panel"])
+        if not self._dock_manual:
+            self._dock_on = bool(self._config["left_dock"])
         self._save_config()
         stop_background_music()
         if self._sounds:
@@ -1197,8 +1475,9 @@ class MechanicusApp(App):
 
     def on_resize(self, event: events.Resize) -> None:
         width = event.size.width if event.size is not None else self._term_width()
+        self._auto_dock(width)
         self._apply_stage_width(width)
-        self._auto_panel(min(STAGE_MAX_WIDTH, width))
+        self._auto_panel(self._stage_width())
 
     @staticmethod
     def _stop_timer(timer: Timer | None) -> None:
@@ -1214,13 +1493,63 @@ class MechanicusApp(App):
             return size.width
         return 80
 
+    def _scene_max(self) -> int:
+        return SCENE_WIDTH_DOCKED if self._dock_on else STAGE_MAX_WIDTH
+
     def _stage_width(self) -> int:
-        return min(STAGE_MAX_WIDTH, self._term_width())
+        return min(self._scene_max(), self._term_width())
 
     def _apply_stage_width(self, width: int | None = None) -> None:
         if width is None:
             width = self._term_width()
-        self.query_one("#main").styles.width = min(STAGE_MAX_WIDTH, max(40, width))
+        self.query_one("#main").styles.width = min(self._scene_max(), max(40, width))
+
+    def _log_width_for(self, width: int | None = None, dock: bool | None = None, panel: bool | None = None) -> int:
+        term = width if width is not None else self._term_width()
+        dock = self._dock_on if dock is None else dock
+        panel = self._panel_on if panel is None else panel
+        scene = min(SCENE_WIDTH_DOCKED if dock else STAGE_MAX_WIDTH, term)
+        if dock:
+            scene -= DOCK_WIDTH
+        if panel:
+            scene -= 40
+        return scene
+
+    def _dock_fits(self) -> bool:
+        return self._log_width_for(dock=True) >= DOCK_MIN_LOG_WIDTH
+
+    def _dock_auto_for(self, width: int) -> bool:
+        return width >= SCENE_WIDTH_DOCKED and self._log_width_for(width, dock=True) >= DOCK_MIN_LOG_WIDTH
+
+    def _apply_dock_visibility(self) -> None:
+        col = self.query_one("#dock-col")
+        if self._dock_on:
+            col.add_class("visible")
+        else:
+            col.remove_class("visible")
+
+    def _auto_dock(self, width: int | None = None) -> None:
+        if self._dock_manual:
+            return
+        if width is None:
+            width = self._term_width()
+        show = self._dock_auto_for(width)
+        if show != self._dock_on:
+            self._dock_on = show
+            self._apply_dock_visibility()
+
+    def _set_dock(self, on: bool) -> bool:
+        if on and not self._dock_on and not self._dock_fits():
+            self._set_status("Недостаточно ширины терминала.")
+            return False
+        self._dock_on = on
+        self._dock_manual = True
+        self._apply_dock_visibility()
+        self._apply_stage_width()
+        self._auto_panel(self._stage_width())
+        self._save_config()
+        self._set_status("Левая панель открыта." if on else "Левая панель скрыта.")
+        return True
 
     def _chat(self) -> VerticalScroll:
         return self.query_one("#chat-scroll", VerticalScroll)
@@ -1258,11 +1587,15 @@ class MechanicusApp(App):
         return [("ARCHIVE TERMINAL", STYLE_BRASS)]
 
     def _print_banner(self) -> None:
-        pairs = self._banner_lines(self._term_width())
         chat = self._chat()
+        width = chat.content_size.width
+        if width <= 0:
+            width = self._term_width()
+        pairs = self._banner_lines(width)
         at_end = chat.is_vertical_scroll_end
         self._banner_pairs = pairs
         self._banner_idx = 0
+        self._banner_event = asyncio.Event()
         for text, _style in pairs:
             chat.mount(Static(Text(text, style=STYLE_DIM), markup=False, classes="banner"))
         if at_end:
@@ -1275,6 +1608,8 @@ class MechanicusApp(App):
             if self._banner_idx >= len(pairs):
                 self._stop_timer(self._fx_banner_timer)
                 self._fx_banner_timer = None
+                if self._banner_event is not None:
+                    self._banner_event.set()
                 return
             text, style = pairs[self._banner_idx]
             widgets = self._chat().query(".banner")
@@ -1288,6 +1623,7 @@ class MechanicusApp(App):
     def _start_header_reveal(self) -> None:
         self._header_target = "ARCHIVE TERMINAL · ADEPTUS MECHANICUS"
         self._header_pos = 0
+        self._header_event = asyncio.Event()
         self._fx_header_timer = self.set_interval(HEADER_TICK, self._header_tick)
 
     def _header_tick(self) -> None:
@@ -1301,10 +1637,20 @@ class MechanicusApp(App):
                 self.query_one("#session-tag").update(
                     f"┌ ПАРАМЕТРЫ СЕАНСА · {self._greeting} ┐"
                 )
+                if self._header_event is not None:
+                    self._header_event.set()
                 self._print_banner()
         except Exception:
             self._stop_timer(self._fx_header_timer)
             self._fx_header_timer = None
+
+    async def _wait_header(self) -> None:
+        if self._header_event is not None:
+            await self._header_event.wait()
+
+    async def _wait_banner(self) -> None:
+        if self._banner_event is not None:
+            await self._banner_event.wait()
 
     def _set_status(self, text: str) -> None:
         self.query_one("#status").update(Text(text))
@@ -1337,20 +1683,6 @@ class MechanicusApp(App):
         else:
             spinner.remove_class("busy")
             row.remove_class("-busy")
-            row.remove_class("-pulse-alt")
-        if self._crt_on:
-            if busy and self._fx_pulse_timer is None:
-                self._fx_pulse_timer = self.set_interval(PULSE_TICK, self._pulse_tick)
-            elif not busy:
-                self._stop_timer(self._fx_pulse_timer)
-                self._fx_pulse_timer = None
-
-    def _pulse_tick(self) -> None:
-        try:
-            row = self.query_one("#status-row")
-            row.toggle_class("-pulse-alt")
-        except Exception:
-            pass
 
     def _apply_panel_visibility(self) -> None:
         col = self.query_one("#sources-col")
@@ -1364,7 +1696,7 @@ class MechanicusApp(App):
             return
         if width is None:
             width = self._stage_width()
-        show = width >= PANEL_AUTO_WIDTH
+        show = width - (DOCK_WIDTH if self._dock_on else 0) >= PANEL_AUTO_WIDTH
         if show != self._panel_on:
             self._panel_on = show
             self._apply_panel_visibility()
@@ -1383,6 +1715,8 @@ class MechanicusApp(App):
                 Static(
                     Text("Источников пока нет — сначала задайте вопрос.", style=STYLE_DIM),
                     markup=False,
+                    id="sources-empty",
+                    classes="reveal-hidden" if not self._startup_done else "",
                 )
             )
 
@@ -1403,114 +1737,68 @@ class MechanicusApp(App):
             chapter = " / ".join(parts) or "без главы"
             if len(chapter) > 60:
                 chapter = chapter[:57] + "..."
-            score = chunk.get("score", 0.0)
+            score = float(chunk.get("score") or 0.0)
+            percent = (
+                int(round(min(max(score, 0.0), 1.0) * 100))
+                if score <= 1.0
+                else int(round(min(max(score, 0.0), 100.0)))
+            )
+            meta = f"{chapter} · релевантность {percent}%"
             row = Text.assemble(
                 (f"{i}. ", STYLE_BRASS),
                 (title, STYLE_BONE),
                 ("\n   ", STYLE_DIM),
-                (f"{chapter} · релевантность {score:.2f}", STYLE_DIM),
+                (meta, STYLE_DIM),
             )
             box.mount(Static(row, markup=False))
             box.mount(Static("", markup=False))
 
-    def _session_row(self, label: str, value: str) -> Text:
-        return Text.assemble(
-            (f"{label}  ", STYLE_DIM),
-            (value, STYLE_BONE),
-        )
+    def _init_dock_data(self) -> None:
+        self._tick_clock()
+        self._tick_dock_data()
+        self._tick_ping()
 
-    def _init_session_data(self) -> None:
-        self._apply_session_values(
-            {
-                "s-epoch": "—",
-                "s-count": "0",
-                "s-relevance": "—",
-                "s-theme": THEME_DISPLAY_NAMES.get(self.theme, self.theme),
-            }
-        )
-
-    def _update_session_data(self, chunks: list[dict]) -> None:
-        scores = [float(c.get("score", 0.0)) for c in chunks if c.get("score") is not None]
-        relevance = f"{max(scores):.2f}" if scores else "—"
-        self._apply_session_values(
-            {
-                "s-epoch": self._era_short(chunks),
-                "s-count": str(len(chunks)),
-                "s-relevance": relevance,
-                "s-theme": THEME_DISPLAY_NAMES.get(self.theme, self.theme),
-            }
-        )
-
-    @staticmethod
-    def _era_short(chunks: list[dict]) -> str:
-        counts: dict[str, int] = {}
-        for chunk in chunks:
-            era = chunk.get("era")
-            if era:
-                counts[era] = counts.get(era, 0) + 1
-        if not counts:
-            return "—"
-        era = max(counts, key=counts.get)
-        return {"heresy": "M30-31", "current": "M41-42"}.get(era, "—")
-
-    def _apply_session_values(self, values: dict[str, str]) -> None:
-        for widget_id, value in values.items():
-            if self._session_targets.get(widget_id) == value:
-                continue
-            self._session_targets[widget_id] = value
-            widget = self.query_one(f"#{widget_id}", Static)
-            if self._crt_on:
-                self._scramble_value(widget_id, SESSION_LABELS[widget_id], value)
-            else:
-                widget.update(self._session_row(SESSION_LABELS[widget_id], value))
-
-    def _scramble_value(self, widget_id: str, label: str, value: str) -> None:
-        state = self._scramble_states.get(widget_id)
-        if state is None:
-            state = {"label": label, "target": value, "shown": 0}
-            self._scramble_states[widget_id] = state
+    def _apply_dock_value(self, widget_id: str, value: str, style: Style | None = None) -> None:
+        widget = self.query_one(f"#{widget_id}", Static)
+        if style is None:
+            widget.update(value)
         else:
-            state["label"] = label
-            state["target"] = value
-            state["shown"] = min(state["shown"], len(value))
-        if self._fx_scramble_timer is None:
-            self._fx_scramble_timer = self.set_interval(SCRAMBLE_TICK, self._scramble_tick)
+            widget.update(Text(value, style=style))
 
-    def _scramble_tick(self) -> None:
-        if not self._crt_on:
-            self._scramble_finish_all()
-            return
-        done: list[str] = []
-        for widget_id, state in list(self._scramble_states.items()):
-            target = state["target"]
-            shown = min(state["shown"] + SCRAMBLE_STEP, len(target))
-            state["shown"] = shown
-            widget = self.query_one(f"#{widget_id}", Static)
-            if shown >= len(target):
-                done.append(widget_id)
-                widget.update(self._session_row(state["label"], target))
-            else:
-                tail = "".join(
-                    random.choice(SCRAMBLE_GLYPHS) for _ in range(len(target) - shown)
-                )
-                widget.update(self._session_row(state["label"], target[:shown] + tail))
-        for widget_id in done:
-            self._scramble_states.pop(widget_id, None)
-        if not self._scramble_states:
-            self._stop_timer(self._fx_scramble_timer)
-            self._fx_scramble_timer = None
+    def _tick_clock(self) -> None:
+        now = datetime.now()
+        clock = now.strftime("%H:%M:%S")
+        if clock != self._last_clock:
+            self._last_clock = clock
+            self._apply_dock_value("clock", clock)
+        dow = WEEKDAY_NAMES[now.weekday()]
+        if dow != self._last_dow:
+            self._last_dow = dow
+            self._apply_dock_value("dock-dow", dow)
+        date = f"{now.day} {MONTH_NAMES[now.month - 1]} {now.year}"
+        if date != self._last_date:
+            self._last_date = date
+            self._apply_dock_value("dock-date", date)
 
-    def _scramble_finish_all(self) -> None:
-        for widget_id, state in list(self._scramble_states.items()):
-            try:
-                self.query_one(f"#{widget_id}", Static).update(
-                    self._session_row(state["label"], state["target"])
-                )
-            except Exception:
-                pass
-        self._scramble_states.clear()
-        self._stop_timer(self._fx_scramble_timer)
-        self._fx_scramble_timer = None
+    def _tick_dock_data(self) -> None:
+        power = _battery_text()
+        if power != self._last_power:
+            self._last_power = power
+            self._apply_dock_value("d-power", power)
+
+    def _tick_ping(self) -> None:
+        self._ping_worker()
+
+    @work(thread=True, group="sysinfo-ping", exclusive=True)
+    def _ping_worker(self) -> None:
+        text, style = _measure_ping(PING_HOST)
+        self.call_from_thread(self._apply_ping, text, style)
+
+    def _apply_ping(self, text: str, style: Style) -> None:
+        if text != self._last_ping:
+            self._last_ping = text
+            self._apply_dock_value("d-ping", text, style)
+
 
     def action_toggle_sources(self) -> None:
         self._set_panel(not self._panel_on)
@@ -1521,13 +1809,15 @@ class MechanicusApp(App):
                 "Панель источников " + ("открыта." if self._panel_on else "скрыта.")
             )
 
+    def action_toggle_dock(self) -> None:
+        self._set_dock(not self._dock_on)
+
     def set_theme(self, name: str) -> None:
         if name not in THEME_NAMES:
             return
         self.theme = name
         self._save_config()
         self._set_status(f"Тема: {THEME_DISPLAY_NAMES[name]}.")
-        self._apply_session_values({"s-theme": THEME_DISPLAY_NAMES[name]})
 
     def action_cycle_theme(self) -> None:
         idx = (THEME_NAMES.index(self.theme) + 1) % len(THEME_NAMES)
@@ -1549,18 +1839,8 @@ class MechanicusApp(App):
     def action_help(self) -> None:
         self.push_screen(HelpModal())
 
-    def action_command_palette(self) -> None:
-        commands = [
-            SimpleCommand("Показать или скрыть источники", self.action_toggle_sources, "Ctrl+F"),
-            SimpleCommand("Сменить тему", self.action_cycle_theme, "Ctrl+T"),
-            SimpleCommand("Настройки: звук, печать, музыка", self.action_settings, "Ctrl+S"),
-            SimpleCommand("Справка по клавишам", self.action_help, "F1"),
-            SimpleCommand("Прокрутить журнал вверх", self.action_scroll_log_up, "Ctrl+U"),
-            SimpleCommand("Прокрутить журнал вниз", self.action_scroll_log_down, "Ctrl+D"),
-            SimpleCommand("Очистить журнал", self.action_clear_log, "Ctrl+L"),
-            SimpleCommand("Выйти", self.action_quit, "Ctrl+Q"),
-        ]
-        self.search_commands(commands, placeholder="Команда…")
+    def action_passwd(self) -> None:
+        self.push_screen(PasswordModal())
 
     def action_quit(self) -> None:
         self.exit()
@@ -1601,6 +1881,9 @@ class MechanicusApp(App):
             return
         if question == "/theme":
             self.action_cycle_theme()
+            return
+        if question == "/passwd":
+            self.action_passwd()
             return
         if question == "/clear":
             self.action_clear_log()
@@ -1731,9 +2014,21 @@ class MechanicusApp(App):
                 self._typing_active = False
 
     def on_key(self, event: events.Key) -> None:
+        if self._startup.running:
+            self._startup.skip()
+            event.stop()
+            event.prevent_default()
+            return
         if self._typing_active:
             self._skip_typing = True
             event.stop()
+
+    @on(events.MouseDown)
+    def _on_reveal_mouse(self, event: events.MouseDown) -> None:
+        if self._startup.running:
+            self._startup.skip()
+            event.stop()
+            event.prevent_default()
 
     @work(thread=True, group="answer", exclusive=True)
     def _ask_worker(self, question: str, era_override: list[dict] | None):
@@ -1787,13 +2082,22 @@ class MechanicusApp(App):
             await self._wait_for_chat()
         if result.get("ok"):
             self._append_msg(Text("Машинный Дух пробуждён. Архив открыт.", style=STYLE_DIM))
-            self._set_status("Готов к приёму запроса.")
+            if self._startup_reveal:
+                self._startup.start()
+            else:
+                self._set_status("Готов к приёму запроса.")
+                self._start_header_reveal()
+                self.query_one("#question", QuestionInput).focus()
         else:
             self._append_msg(
                 Text(f"Ошибка прогрева моделей: {result.get('error')}", style=STYLE_BLOOD)
             )
-            self._set_status("Ошибка прогрева. См. журнал.")
-        self.query_one("#question", QuestionInput).focus()
+            if self._startup_reveal and not self._startup_done:
+                self._finish_reveal("Ошибка прогрева. См. журнал.")
+            else:
+                self._set_status("Ошибка прогрева. См. журнал.")
+                self._start_header_reveal()
+                self.query_one("#question", QuestionInput).focus()
 
     async def _wait_for_chat(self, timeout: float = 5.0) -> None:
         deadline = time.monotonic() + timeout
@@ -1811,7 +2115,6 @@ class MechanicusApp(App):
 
         if kind == "ok":
             chunks = result.get("chunks", [])
-            self._update_session_data(chunks)
             self._update_sources(chunks)
             self._set_status("Протокол поиска завершён.")
             if self._sounds:
@@ -1867,76 +2170,130 @@ class MechanicusApp(App):
                 self._boot_stage_started = time.monotonic()
                 return
 
-    def _scan_tick(self) -> None:
-        if not self._crt_on:
-            return
-        try:
-            frame = self.query_one("#log-frame")
-            height = max(1, frame.content_size.height - 1)
-            self._scan_y += height / (SCANLINE_PERIOD / SCANLINE_TICK)
-            self.query_one("#scanline").styles.offset = Offset(0, int(self._scan_y) % height)
-        except Exception:
-            pass
+    def _is_shown(self, widget) -> bool:
+        node = widget
+        while node is not None:
+            if not getattr(node, "display", True):
+                return False
+            node = node.parent
+        return True
 
-    def _schedule_flicker(self) -> None:
-        if not self._crt_on:
+    def _reveal_widgets(self) -> list:
+        widgets: list = []
+        for widget_id in (
+            "#dock-col", "#clock", "#dock-dow", "#dock-date", "#dock-filler", "#dock-data",
+            "#log-frame", "#sources-col", "#gutter-left", "#gutter-right",
+            "#status-row", "#status", "#input-row", "#prompt", "#question", "#startup-line",
+        ):
+            widgets.extend(self.query(widget_id))
+        widgets.extend(self.query(".dock-row"))
+        widgets.extend(self.query("#sources-empty"))
+        return widgets
+
+    async def _stage1_boot(self) -> None:
+        line = self.query_one("#startup-line")
+        line.styles.display = "block"
+        await RevealEffects.fade(line, STARTUP_ROW_FADE)
+        await asyncio.sleep(STARTUP_BOOT_PAUSE)
+        line.styles.clear_rule("display")
+        RevealEffects.show(line)
+
+    async def _stage2_identify(self) -> None:
+        self._start_header_reveal()
+        await self._wait_header()
+
+    async def _stage3_status(self) -> None:
+        await RevealEffects.fade(self.query_one("#status-row"), STARTUP_FRAME_FADE)
+        await RevealEffects.fade(self.query_one("#status"), STARTUP_ROW_FADE)
+        await asyncio.sleep(STARTUP_STATUS_PAUSE)
+        self._set_status("Проверка подсистем...")
+
+    async def _stage4_main(self) -> None:
+        await RevealEffects.fade(self.query_one("#log-frame"), STARTUP_FRAME_FADE)
+        await self._wait_banner()
+
+    async def _reveal_dock_panel(self) -> None:
+        dock = self.query_one("#dock-col")
+        if not self._is_shown(dock):
             return
-        self._fx_flicker_timer = self.set_timer(
-            random.uniform(FLICKER_MIN, FLICKER_MAX), self._do_flicker
+        await RevealEffects.fade(dock, STARTUP_FRAME_FADE)
+        for widget_id in ("#clock", "#dock-dow", "#dock-date"):
+            await RevealEffects.rise(self.query_one(widget_id), STARTUP_ROW_FADE)
+        await RevealEffects.fade(self.query_one("#dock-data"), STARTUP_FRAME_FADE)
+        for widget in self.query(".dock-row"):
+            if self._is_shown(widget):
+                await RevealEffects.rise(widget, STARTUP_ROW_FADE)
+
+    async def _reveal_sources_panel(self) -> None:
+        col = self.query_one("#sources-col")
+        if not self._is_shown(col):
+            return
+        await RevealEffects.fade(col, STARTUP_FRAME_FADE)
+        for widget in self.query("#sources-empty"):
+            if self._is_shown(widget):
+                await RevealEffects.rise(widget, STARTUP_ROW_FADE)
+
+    async def _stage5_panels(self) -> None:
+        await asyncio.gather(self._reveal_dock_panel(), self._reveal_sources_panel())
+
+    async def _stage6_data(self) -> None:
+        await asyncio.gather(
+            *[
+                RevealEffects.fade(self.query_one(widget_id), STARTUP_GUTTER_FADE)
+                for widget_id in ("#gutter-left", "#gutter-right", "#dock-filler")
+                if self._is_shown(self.query_one(widget_id))
+            ]
         )
 
-    def _do_flicker(self) -> None:
-        self._fx_flicker_timer = None
-        if not self._crt_on:
-            return
-        band = self._headline_widget
-        if band is not None and band.is_attached:
-            band.add_class("-flicker")
-            self._fx_flicker_timer = self.set_timer(
-                random.uniform(FLICKER_HOLD_MIN, FLICKER_HOLD_MAX), self._end_flicker
-            )
-        else:
-            self._schedule_flicker()
+    async def _stage7_navigation(self) -> None:
+        await RevealEffects.fade(self.query_one("#input-row"), STARTUP_FRAME_FADE)
+        await RevealEffects.rise(self.query_one("#prompt"), STARTUP_ROW_FADE)
+        await RevealEffects.rise(self.query_one("#question"), STARTUP_ROW_FADE)
 
-    def _end_flicker(self) -> None:
-        self._fx_flicker_timer = None
-        band = self._headline_widget
-        if band is not None and band.is_attached:
-            band.remove_class("-flicker")
-        self._schedule_flicker()
+    async def _stage8_ready(self) -> None:
+        self._startup_done = True
+        question = self.query_one("#question", QuestionInput)
+        question.disabled = self._busy
+        question.focus()
 
-    def _start_crt_effects(self) -> None:
-        if not self._crt_on:
-            return
-        self.query_one("#scanline").add_class("-on")
-        if self._fx_scan_timer is None:
-            self._fx_scan_timer = self.set_interval(SCANLINE_TICK, self._scan_tick)
-        self._schedule_flicker()
-        if self._busy and self._fx_pulse_timer is None:
-            self._fx_pulse_timer = self.set_interval(PULSE_TICK, self._pulse_tick)
+    def _finish_header_now(self) -> None:
+        if self._fx_header_timer is not None:
+            self._stop_timer(self._fx_header_timer)
+            self._fx_header_timer = None
+        if not self._header_target:
+            self._header_target = "ARCHIVE TERMINAL · ADEPTUS MECHANICUS"
+        self.query_one("#header-line").update(self._header_target)
+        self.query_one("#session-tag").update(f"┌ ПАРАМЕТРЫ СЕАНСА · {self._greeting} ┐")
+        if self._header_event is not None:
+            self._header_event.set()
 
-    def _stop_crt_effects(self) -> None:
-        for timer in (
-            self._fx_scan_timer,
-            self._fx_flicker_timer,
-            self._fx_pulse_timer,
-            self._fx_scramble_timer,
-            self._fx_flash_timer,
-        ):
-            self._stop_timer(timer)
-        self._fx_scan_timer = None
-        self._fx_flicker_timer = None
-        self._fx_pulse_timer = None
-        self._fx_scramble_timer = None
-        self._fx_flash_timer = None
-        self._scramble_finish_all()
-        try:
-            self.query_one("#scanline").remove_class("-on")
-            self.query_one("#status-row").remove_class("-pulse-alt", "-flash")
-        except Exception:
-            pass
-        if self._headline_widget is not None and self._headline_widget.is_attached:
-            self._headline_widget.remove_class("-flicker")
+    def _finish_banner_now(self) -> None:
+        if not self._banner_pairs:
+            self._print_banner()
+        if self._fx_banner_timer is not None:
+            self._stop_timer(self._fx_banner_timer)
+            self._fx_banner_timer = None
+        widgets = self._chat().query(".banner")
+        for index, widget in enumerate(widgets):
+            if index < len(self._banner_pairs):
+                text, style = self._banner_pairs[index]
+                widget.update(Text(text, style=style))
+        self._banner_idx = len(self._banner_pairs)
+        if self._banner_event is not None:
+            self._banner_event.set()
+
+    def _finish_reveal(self, final_status: str | None = "Готов к приёму запроса.") -> None:
+        self._startup_done = True
+        self._finish_header_now()
+        self._finish_banner_now()
+        self.query_one("#startup-line").styles.clear_rule("display")
+        for widget in self._reveal_widgets():
+            RevealEffects.show(widget)
+        if final_status is not None:
+            self._set_status(final_status)
+        question = self.query_one("#question", QuestionInput)
+        question.disabled = self._busy
+        question.focus()
 
 
 def _prewarm_subprocess_primitives() -> None:
