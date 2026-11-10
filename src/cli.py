@@ -203,12 +203,10 @@ def _resolve_and_answer(question: str):
         except TokensExhaustedError as e:
             stop_spinner(spin_stop, spin_thread)
             _redraw(f"{echo}\n\n{green(str(e))}")
-            play_sound("error")
             return None
         except AccessDeniedError as e:
             stop_spinner(spin_stop, spin_thread)
             _redraw(f"{echo}\n\n{green(str(e))}")
-            play_sound("error")
             return None
         except RuntimeError as e:
             stop_spinner(spin_stop, spin_thread)
@@ -250,8 +248,8 @@ def _run(last_chunks):
         if _is_identity_question(question):
             echo = dim(f"> {question}")
             _redraw(echo)
+            play_sound("identity")
             type_out(random.choice(IDENTITY_RESPONSES))
-            play_sound("answer")
             continue
 
         result = _resolve_and_answer(question)

@@ -122,7 +122,7 @@ SOUND_FILES = {
     "startup": "startup",
     "answer": "answer",
     "exit": "exit",
-    "error": "error",
+    "identity": "identity",
 }
 
 # фоновая музыка, зацикленная на всё время работы CLI

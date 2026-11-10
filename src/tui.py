@@ -2034,6 +2034,8 @@ class MechanicusApp(App):
         if _is_identity_question(question):
             self._set_busy(True)
             self._set_status("Машинный Дух отвечает...")
+            if self._sounds:
+                play_sound("identity")
             self._type_reply(random.choice(IDENTITY_RESPONSES))
         else:
             self._set_busy(True)
@@ -2267,8 +2269,6 @@ class MechanicusApp(App):
         self._set_busy(False)
         self._append_msg(Text(result.get("text", "Неизвестная ошибка."), style=STYLE_DIM))
         self._set_status("Ошибка обработки запроса.")
-        if self._sounds:
-            play_sound("error")
         self.query_one("#question", QuestionInput).focus()
 
     def _on_era_chosen(self, era: str | None) -> None:
