@@ -28,6 +28,8 @@ from textual.widgets import (
     SelectionList,
     Static,
     Switch,
+    TabbedContent,
+    TabPane,
 )
 from textual.worker import Worker, WorkerState
 
@@ -74,6 +76,7 @@ STYLE_DULL_BRASS = Style(color=DULL_BRASS)
 STYLE_GREEN = Style(color=GREEN)
 STYLE_DARK_GREEN = Style(color=DARK_GREEN)
 STYLE_DIM = Style(color=DIM_GREEN)
+STYLE_PHOSPHOR = Style(color=PHOSPHOR_BRIGHT)
 
 TYPEWRITER_DELAY = 0.012
 
@@ -475,76 +478,202 @@ class EraModal(ModalScreen):
 
 
 class HelpModal(ModalScreen):
+    """Расширенная справка: вкладки «Команды» и «Клавиши» в окне 72 колонки.
+
+    Описания получают всю ширину вкладки (68 колонок); в описаниях команд
+    упомянуты клавиши-дублёры, в описаниях клавиш — команды-дублёры.
+    """
+
+    CSS = """
+    #dialog {
+        width: 72;
+        max-width: 100%;
+        padding: 1 1;
+    }
+
+    TabbedContent {
+        height: auto;
+        border: none;
+        background: $surface;
+    }
+
+    TabbedContent TabPane {
+        padding: 1 0 0 0;
+        border: none;
+        background: $surface;
+    }
+
+    TabbedContent Tab {
+        padding: 0 2;
+        color: $dim-green;
+    }
+
+    TabbedContent Tab.-active {
+        color: $phosphor-bright;
+        text-style: bold;
+    }
+
+    TabbedContent Underline > .underline--bar {
+        color: $phosphor-bright;
+        background: $frame;
+    }
+    """
+
     BINDINGS = [
         Binding("escape", "close", "Закрыть"),
         Binding("enter", "close", "Закрыть", show=False),
+        Binding("left", "previous_tab", "Предыдущая вкладка", show=False),
+        Binding("right", "next_tab", "Следующая вкладка", show=False),
+        Binding("tab", "next_tab", "Следующая вкладка", show=False),
+        Binding("shift+tab", "previous_tab", "Предыдущая вкладка", show=False),
     ]
 
     def action_close(self) -> None:
         self.dismiss(None)
 
+    def action_next_tab(self) -> None:
+        self._cycle_tab(1)
+
+    def action_previous_tab(self) -> None:
+        self._cycle_tab(-1)
+
+    def _cycle_tab(self, step: int) -> None:
+        content = self.query_one(TabbedContent)
+        tab_ids = ["commands", "keys"]
+        try:
+            idx = tab_ids.index(content.active)
+        except ValueError:
+            idx = 0
+        content.active = tab_ids[(idx + step) % len(tab_ids)]
+
     def compose(self) -> ComposeResult:
         with Center():
             with Vertical(id="dialog"):
-                yield Static(self._help_text(), markup=False)
+                with TabbedContent(initial="commands"):
+                    with TabPane("КОМАНДЫ", id="commands"):
+                        yield Static(self._commands_text(), markup=False)
+                    with TabPane("КЛАВИШИ", id="keys"):
+                        yield Static(self._keys_text(), markup=False)
                 yield Static(
-                    Text("Esc / Enter — закрыть", style=STYLE_DIM),
+                    Text(
+                        "← / → или Tab — вкладки · Esc / Enter — закрыть",
+                        style=STYLE_DIM,
+                    ),
                     markup=False,
                 )
 
     def on_mount(self) -> None:
         dialog = self.query_one("#dialog")
         dialog.border_title = " СПРАВКА "
+        dialog.border_subtitle = " КОМАНДЫ И ГОРЯЧИЕ КЛАВИШИ "
+        self.query_one(TabbedContent).focus()
 
     @staticmethod
-    def _help_text() -> Text:
+    def _commands_text() -> Text:
+        """Вкладка «Команды»: слэш-команды, в описаниях — клавиши-дублёры."""
         rows = [
-            ("Ctrl+F", "показать/скрыть панель источников последнего ответа"),
-            ("Ctrl+B", "показать/скрыть левую панель «Система»"),
-            ("Ctrl+S", "настройки (звук, печатная машинка, музыка, тема)"),
-            ("Ctrl+T", "следующая тема (палитра цветов не меняется)"),
-            ("Ctrl+U / Ctrl+D", "прокрутка журнала вверх/вниз"),
-            ("PgUp / PgDn, колесо мыши", "прокрутка журнала"),
-            ("↑ / ↓", "история вопросов в строке ввода"),
-            ("Tab / Shift+Tab", "автодополнение команд (например, /so → /sources)"),
-            ("Ctrl+L", "очистить журнал"),
-            ("F1", "эта справка"),
-            ("Ctrl+C / Ctrl+Q", "выход"),
+            ("/clear", "очистить журнал", "Ctrl+L"),
+            ("/exit", "завершить сеанс", "Ctrl+C / Ctrl+Q"),
+            ("/quit", "синоним /exit", ""),
+            ("/help", "открыть эту справку", "F1"),
+            ("/passwd", "сменить пароль", ""),
+            ("/sources", "источники последнего ответа", "Ctrl+F"),
+            ("/theme", "следующая тема", "Ctrl+T"),
         ]
         out = Text()
-        for key, desc in rows:
-            lines = HelpModal._wrap_desc(key, desc) or [""]
-            key_disp = f"{key:<24}" if len(key) <= 24 else f"{key} "
-            out.append("  ", style=STYLE_IRON)
-            out.append(key_disp, style=STYLE_BRASS)
-            out.append(f"{lines[0]}\n", style=STYLE_BONE)
-            indent = " " * (2 + len(key_disp))
-            for extra in lines[1:]:
-                out.append(indent + extra + "\n", style=STYLE_BONE)
+        out.append(
+            "Команды вводятся в строке вопроса; клавиша-дублёр — в описании.\n\n",
+            style=STYLE_DIM,
+        )
+        for command, desc, key in rows:
+            HelpModal._append_row(
+                out, command, STYLE_PHOSPHOR, desc, "— то же, что", key
+            )
         return out
 
     @staticmethod
-    def _wrap_desc(key: str, desc: str) -> list[str]:
-        key_disp = f"{key:<24}" if len(key) <= 24 else f"{key} "
-        capacity = max(10, 60 - 2 - len(key_disp))
-        words = desc.split(" ")
-        wrapped: list[str] = []
-        current = ""
-        for word in words:
-            candidate = f"{current} {word}".strip()
-            if len(candidate) <= capacity:
-                current = candidate
-                continue
-            if current:
-                wrapped.append(current)
-                current = ""
-            while len(word) > capacity:
-                wrapped.append(word[:capacity])
-                word = word[capacity:]
-            current = word
-        if current:
-            wrapped.append(current)
-        return wrapped
+    def _keys_text() -> Text:
+        """Вкладка «Клавиши»: горячие клавиши, в описаниях — команды-дублёры."""
+        rows = [
+            ("Ctrl+F", "панель источников последнего ответа", "/sources"),
+            ("Ctrl+B", "левая панель «Система»", ""),
+            ("Ctrl+S", "настройки: звук, печатная машинка, музыка", ""),
+            ("Ctrl+T", "следующая тема", "/theme"),
+            ("Ctrl+U/D", "прокрутка журнала вверх/вниз", ""),
+            ("PgUp/PgDn", "прокрутка журнала (и колесо мыши)", ""),
+            ("↑ / ↓", "история вопросов в строке ввода", ""),
+            ("Tab", "автодополнение команд: /so → /sources, Shift+Tab — назад", ""),
+            ("Ctrl+L", "очистить журнал", "/clear"),
+            ("F1", "эта справка", "/help"),
+            ("Ctrl+C/Q", "выход", "/exit"),
+            ("Esc", "закрыть окно справки", ""),
+        ]
+        out = Text()
+        out.append(
+            "Клавиши работают в главном окне; команда-дублёр — в описании.\n\n",
+            style=STYLE_DIM,
+        )
+        for key, desc, command in rows:
+            HelpModal._append_row(
+                out, key, STYLE_BRASS, desc, "— команда", command
+            )
+        out.append("\n", style=STYLE_IRON)
+        out.append(
+            "Любая клавиша во время печати ответа допечатывает его мгновенно.",
+            style=STYLE_DIM,
+        )
+        out.append("\n")
+        return out
+
+    @staticmethod
+    def _append_row(
+        out: Text,
+        key: str,
+        key_style: Style,
+        desc: str,
+        ref_prefix: str,
+        ref: str,
+    ) -> None:
+        """Строка «ключ | описание» с переносом описания висячим отступом.
+
+        Ключ занимает колонку 10, описание переносится по словам, упоминание
+        клавиши/команды-дублёра пристыковывается к описанию приглушённым
+        цветом.
+        """
+        capacity = 68 - 2 - 10
+        out.append("  ", style=STYLE_IRON)
+        out.append(f"{key:<10}", style=key_style)
+        line_len = 2 + 10
+
+        # Описание переносится по словам с висячим отступом.
+        for word in desc.split(" "):
+            if line_len + 1 + len(word) > capacity and line_len > 2 + 10:
+                out.append("\n", style=STYLE_IRON)
+                out.append(" " * 12, style=STYLE_IRON)
+                line_len = 12
+            else:
+                if line_len > 2 + 10:
+                    out.append(" ", style=STYLE_BONE)
+                    line_len += 1
+            out.append(word, style=STYLE_BONE)
+            line_len += len(word)
+
+        # Упоминание клавиши/команды-дублёра — неразрывный блок: если не
+        # помещается на текущей строке, переносится целиком на следующую.
+        if ref:
+            block = (ref_prefix + " " + ref).split(" ")
+            block_len = sum(len(word) for word in block) + (len(block) - 1)
+            if line_len + 1 + block_len > capacity and line_len > 2 + 10:
+                out.append("\n", style=STYLE_IRON)
+                out.append(" " * 12, style=STYLE_IRON)
+                line_len = 12
+            for word in block:
+                if line_len > 2 + 10:
+                    out.append(" ", style=STYLE_DIM)
+                    line_len += 1
+                out.append(word, style=STYLE_DIM)
+                line_len += len(word)
+        out.append("\n")
 
 
 class SettingsModal(ModalScreen):

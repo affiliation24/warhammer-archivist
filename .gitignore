@@ -17,3 +17,5 @@ hf_cache/
 
 # Локальные настройки TUI-интерфейса
 terminal_config.json
+
+auth.json
